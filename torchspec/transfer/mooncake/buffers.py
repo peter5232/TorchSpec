@@ -57,6 +57,8 @@ class HostBuffer:
 
         Returns the number of bytes copied.
         """
+        # 按层切出的 [S,H] 常跨过同 token 的其他层，stride 可能是 [L*H,1]。
+        # 先 contiguous 才能按逻辑顺序发送；view(uint8) 重解释位模式，不把浮点数转换成整数值。
         tensor = tensor.contiguous()
         nbytes = tensor.numel() * tensor.element_size()
 
@@ -222,6 +224,9 @@ class AsyncPutManager:
         future = self._executor.submit(
             self._do_put, keys, buffer_ptrs, sizes, wait_event, device_index
         )
+        # 比如 hs/ids 地址分别为 P、P+192，两者都占用基址 P 的同一缓冲。
+        # 只能登记一次 P；若按子地址登记，池轮回到 P 时可能漏等仍在读取 ids 的传输。
+        # 调用者必须先 wait_for_buffer(P)，否则覆盖这里的旧 Future 会丢失旧任务的等待入口。
         self._in_flight[owner_buffer_ptr] = future
 
     # 后台线程先选择事件所属 GPU 并等待 DtoH 完成，再在锁内调用 batch_put_from；任一写入失败就尽力清理整批键并报错。
@@ -237,6 +242,8 @@ class AsyncPutManager:
             if device_index is not None:
                 torch.cuda.set_device(device_index)
             wait_event.synchronize()
+        # 等事件发生在加锁之前：B 的 CPU 拷贝未完成时，不必挡住已就绪 A 的网络写入。
+        # 此处的锁只保护原生 put 调用；它既不锁 GPU 页，也不替代前面的 CUDA 事件。
         with self._put_lock:
             if self._replicate_config is not None:
                 results = self._store.batch_put_from(
@@ -244,6 +251,8 @@ class AsyncPutManager:
                 )
             else:
                 results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
+        # 一批含 hs 和 ids 时，可能 hs 成功、ids 失败；不能把成功的那个字段当作完整样本。
+        # 清理是尽力补偿，失败仍由 Future.result() 回到生产线程，并非远端原子事务。
         failures = [(k, r) for k, r in zip(keys, results) if r != 0]
         if failures:
             try:
@@ -260,6 +269,8 @@ class AsyncPutManager:
     # 等待全部在途任务，把首个异常缓存给后续 check_last_error，同时清空在途表；本方法自身只记录异常。
     def drain(self) -> None:
         """Wait for every in-flight transfer to finish."""
+        # 即使 A 失败也继续等 B：若在第一处异常提前退出，上层 shutdown 释放 B 会与网卡读并发。
+        # 这里只保存首个错误；EagleMooncakeStore.flush 在 drain 之后显式检查并抛出它。
         for ptr, future in list(self._in_flight.items()):
             try:
                 future.result()

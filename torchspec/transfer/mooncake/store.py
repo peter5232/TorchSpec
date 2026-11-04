@@ -105,6 +105,8 @@ class MooncakeHiddenStateStore(ABC):
                 f"and metadata server is available at {self.config.metadata_server}"
             )
 
+        # setup 成功仅说明客户端连上服务；force-delete 能力和本进程内存注册仍需继续完成。
+        # 下方所有准备结束才发布 _init_event，样本读写不能把连接成功当作资源全部就绪。
         self._verify_force_delete()
         self._build_replicate_config()
 
@@ -213,6 +215,7 @@ class MooncakeHiddenStateStore(ABC):
         """
         if self._init_event.is_set():
             return
+        # Event 是完成通知而不是初始化互斥锁：超时后的 setup 回退不应被理解为任意并发首次调用的锁。
         if not self._init_event.wait(timeout=timeout):
             if not self._initialized:
                 self.setup()
@@ -289,6 +292,9 @@ class MooncakeHiddenStateStore(ABC):
         or GPU staging buffer.
         """
         self._ensure_initialized()
+        # 两层列表分别是“远端对象”与“该对象的源片段”。
+        # 例如 keys=[layer2, layer8]、sizes=[[64,32],[64,32]] 表示两个各 96 字节的对象，
+        # 而非四个对象；这里复制列表只保留地址数字，不会复制或保活它们指向的 CUDA tensor。
         key_list = list(keys)
         ptr_lists = [list(ptrs) for ptrs in all_buffer_ptrs]
         size_lists = [list(sizes) for sizes in all_sizes]
@@ -418,6 +424,8 @@ class MooncakeHiddenStateStore(ABC):
         last_missing = key_list
 
         while True:
+            # 每轮检查完整集合，而非只查上轮缺项：上次可见的键也可能已被删除。
+            # 这只是此刻的存在性观察，不给对象加读锁；通过后仍需 get 路径处理字节获取失败。
             census = self.batch_exists(key_list)
             last_missing = [key for key in key_list if not census[key]]
             if not last_missing:
@@ -429,6 +437,7 @@ class MooncakeHiddenStateStore(ABC):
                     "Timed out waiting for Mooncake keys after "
                     f"{now - start:.3f}s; missing: {missing}"
                 )
+            # 例如剩余 2ms、轮询间隔 50ms，只睡 2ms；单次元数据 RPC 的耗时本身不由此处中断。
             sleep_for = poll_interval
             if deadline is not None:
                 sleep_for = min(sleep_for, max(deadline - now, 0.0))
@@ -500,6 +509,8 @@ class MooncakeHiddenStateStore(ABC):
         if self._async_put_manager is not None:
             self._async_put_manager.shutdown()
             self._async_put_manager = None
+        # 必须先结束后台工作再释放地址：Future 持有的是指针列表，不是 HostBuffer 的所有权。
+        # 对外部注册缓存，本类没有分配/释放权；其拥有者仍须遵守 register_external_buffer 的约定。
         if self._gpu_send_buffer is not None:
             self._gpu_send_buffer.free()
             self._gpu_send_buffer = None

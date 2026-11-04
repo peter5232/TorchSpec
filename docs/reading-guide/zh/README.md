@@ -77,7 +77,19 @@ KV cache 保存 attention 的历史 key/value；Mooncake 在本训练流水线�
 
 完成标志：遇到新的 `forward`，能从输入契约、监督对齐、可见性 mask、归一化和状态生命周期五方面解释它，而不是只复述每条 Python 语句。
 
+### 深入轮：跟着小张量走一次真实实现
+
+完成四轮概念阅读后，按以下顺序检验自己是否能推导中间结果：
+
+1. [监督与损失手算](loss-walkthrough.md)：聊天 mask → 锚点坐标 → gather → CE/KL → 子词表概率质量。
+2. [模型逐步演算](model-walkthrough.md)：EAGLE 两轮预测链、DFlash 块与文本位置、BlockMask 前反向索引。
+3. [跨进程时序演算](transfer-walkthrough.md)：六 token 请求、物理页地址、异步复制、远端发布、接收区复用。
+
+训练更新衔接见[训练教程](training.md)的完整样本生命周期与梯度窗口手算；源码内进一步说明冻结 head 的输入梯度、加权分母、FP32 master 和预取结束边界。
+
 ## 4. 读每个函数时固定问这六个问题
+
+如果已经完成概念阅读，下一步用[监督与损失手算](loss-walkthrough.md)对照真实数组，逐项核对聊天 mask、锚点坐标、gather、CE/KL 和裁剪词表概率质量。不要只记住公式；尝试解释每个中间量在源码中来自哪一行，以及改掉它会破坏什么条件。
 
 1. **谁调用它？** driver、Ray actor、CPU 线程还是 GPU kernel？是否有远程边界？
 2. **输入的单位是什么？** token、样本、batch、字节、GPU rank、草稿深度，不要只看 `int`。

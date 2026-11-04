@@ -194,6 +194,8 @@ class MooncakeDataset(IterableDataset):
             else:
                 # batch_size=1: safe to use pinned views — consumed immediately.
                 # Preserves pinned memory for async H2D via non_blocking=True.
+                # 这只保留 Dataset 返回时的 pinned 属性；DataCollatorWithPadding 后续
+                # 仍会 pad/cat 分配新张量，不能从本分支推断整个 batch 到 H2D 前必然 pinned。
                 result = dict(tensor_dict)
 
             # 这里只在拿到可供消费的本地结果后删除 store 数据。
@@ -466,6 +468,9 @@ class MooncakeDataset(IterableDataset):
         sample: TrainSample,
         local_len: int,
     ) -> dict[str, torch.Tensor]:
+        # 可手算：S=9、SP=2、Ring=2、ttt=2 时，主块长 5、本地长 7。
+        # SP rank 0 读全局 0..6（末两行用于跨片目标），rank 1 读 5..8 后补三行。
+        # 尾部在相邻分片出现并非重复样本，而是给多步目标保留向右看的标签/特征。
         sp_ulysses_size = max(1, self._sp_world_size // self._sp_ring_size)
         global_len = self._usp_global_len(sample)
         chunk_size = self._usp_chunk_size(global_len)
@@ -479,6 +484,9 @@ class MooncakeDataset(IterableDataset):
         if loss_mask.shape[-1] < local_len:
             loss_mask = F.pad(loss_mask, (0, local_len - loss_mask.shape[-1]))
 
+        # loss_mask 从原始监督区域切出；attention_mask 只问该位置是否来自真实输入。
+        # 上例若全局仅 6..8 受监督，rank 1 的两种 mask 分别是 [0,1,1,1,0,0,0]
+        # 和 [1,1,1,1,0,0,0]：位置 5 仍可提供上下文，但不贡献该处监督。
         attention_mask = torch.zeros((1, local_len), dtype=torch.long)
         attention_mask[:, :valid_len] = 1
 
@@ -758,6 +766,8 @@ class PrefetchedDataFetcher:
     def _prefetch_loop(self) -> None:
         try:
             for batch in self.inner:
+                # put 满队列时阻塞；此刻生产者还持有刚读好的 batch，内存不只包含
+                # maxsize 个队列元素，还可能有这一份待入队 batch 和消费者手上的 batch。
                 self._queue.put(batch)
         except Exception as e:
             # Preserve the original traceback so re-raise in __next__
@@ -766,6 +776,8 @@ class PrefetchedDataFetcher:
 
             self._error = e.with_traceback(sys.exc_info()[2])
         finally:
+            # sentinel 排在已成功入队的 batch 后，正常结束会先消费完它们。
+            # 异常则另存于 _error，消费者下一次进入 __next__ 可能优先抛错而不排空队列。
             self._queue.put(self._SENTINEL)
 
     # 只在首次消费时启动 daemon 线程；后续多个训练步共享同一线程和迭代流。
@@ -794,9 +806,13 @@ class PrefetchedDataFetcher:
     def __next__(self) -> Dict[str, torch.Tensor]:
         if self._error is not None:
             raise self._error
+        # 这是主机线程等待，既不是 CUDA barrier，也不表示后台新样本的 H2D 已完成。
+        # 下方 _to_device 才在消费者线程发起传输，然后模型计算沿相应 stream 继续。
         item = self._queue.get()
         if item is self._SENTINEL:
             if self._error is not None:
                 raise self._error
+            # 当前没有记录“永久耗尽”状态：sentinel 只取出一次，再次 next 会等待空队列。
+            # 因此上层应在第一次流结束后停止消费；不能把它当可重复探测结束的普通列表迭代器。
             raise StopIteration
         return self._to_device(item)

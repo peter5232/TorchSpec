@@ -82,6 +82,8 @@ def _extract_from_kv_cache(
     ``kv_cache`` has shape ``(num_blocks, num_heads, block_size, head_size)``.
     This matches latest vLLM's standardized hidden-state connector layout.
     """
+    # 两个长度为 S 的高级索引逐元素配对，不形成 S×S 的笛卡尔积；中间的 : 保留全部捕获层。
+    # 输入 [B,L,P,H] 经索引得到 [S,L,H]，这里 B 是物理页数，绝非训练 batch size。
     block_size = kv_cache.shape[2]
     return kv_cache[
         slot_mapping // block_size,
@@ -101,6 +103,8 @@ def _slot_mapping_from_block_ids(
     """Compute a complete slot mapping from finished-request block IDs."""
     block_ids_gpu = torch.tensor(block_ids, dtype=torch.int64, device=device)
     offsets = torch.arange(page_size, dtype=torch.int64, device=device)
+    # 广播先得到 [页数, P]，按行展平保留请求的页表顺序；不能给 block_ids 排序。
+    # 两请求即使逻辑位置均从 0 开始，也可以借用完全不同的物理页。
     return (block_ids_gpu.unsqueeze(1) * page_size + offsets).flatten()[:num_tokens]
 
 
@@ -335,6 +339,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             self._get_pp_rank(),
             self._pp_size,
         )
+        # 例如模型 8 层、两阶段区间 [0,4)/[4,8)、捕获槽 [2,4,6,8]：
+        # 前阶段发位置 [0,1]，后阶段发 [2,3]。槽 4 是第 4 层执行后的值，属于前阶段。
         return [
             index
             for index, layer_id in enumerate(self._layer_ids)
@@ -522,6 +528,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if hidden_states_3d.dtype != torch.bfloat16:
             hidden_states_3d = hidden_states_3d.to(torch.bfloat16)
+        # 例 S=6、L=4、H=8：gather 是 [6,4,8]；每层 slice 是 [6,8]，通常仍有 stride=[32,1]。
+        # 返回列表里的层张量共享这块独立 gather 分配；store 打包时 contiguous 才使每层字节连续。
         input_ids = pending.token_ids.to(hidden_states_3d.device)
         mooncake_key = _sanitize_mooncake_key(pending.req_id)
 
@@ -564,6 +572,9 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             tensors = []
             used_bytes = 0
 
+        # 批次不是样本事务：S=3、H=2 时一层 BF16=12B、ids int64=24B；容量 60B 可先装
+        # layer2_hs(12)+layer2_ids(24)+layer46_hs(12)，layer46_ids(24) 必须进下一批。
+        # 因而看到某层 hs 键，不代表它的 ids 已可读；一个失败批次也可能牵涉不止一条请求。
         for pending in pending_saves:
             for key, tensor in self._pending_save_tensors(pending, local_positions):
                 tensor_bytes = tensor.numel() * tensor.element_size()
@@ -624,6 +635,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                 cache_ready = torch.cuda.Event()
                 cache_ready.record(torch.cuda.current_stream(self._kv_cache.device))
                 cache_ready.synchronize()
+            # 这里没有 gather 所形成的独立副本，原页是真正的网络源；同步 put 返回前不能释放页。
+            # 仅同步 cache_ready 只保证“模型写完”，还不保证“网卡读完”，后一个边界由 put 返回建立。
             self._mooncake_store.put_from_registered_multi_buffers(
                 hidden_keys,
                 hidden_ptrs,
@@ -662,6 +675,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         finished_req_ids: set[str],
     ) -> tuple[set[str] | None, set[str] | None]:
+        # 本次回调参数不是发布任务来源；使用调度端明确携带页号的 pending_saves，
+        # 避免只有“完成 ID”却无法定位完整序列，或把上轮已移交的任务重复发布。
         del finished_req_ids
         pending_saves: list[_PendingSave] = []
         if self.has_connector_metadata():
@@ -697,6 +712,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         if local_error is not None:
             raise local_error
 
+        # 第一项是允许回收的发送请求集合；第二项是接收完成集合，本连接器只写所以为 None。
+        # 非发布 TP rank 也走到这里：它参与模型/阶段同步，但无需为相同层再建一份远端对象。
         return {pending.req_id for pending in pending_saves}, None
 
     # ==============================
@@ -784,6 +801,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             list(request.prompt_token_ids or []),
         )
         mooncake_meta = self._req_metadata.pop(req_id, None)
+        # token 和页号都做独立快照，后续 scheduler 改动原列表不会改变已排队任务。
+        # 页号快照并未复制页内数据；返回 True 的“暂缓释放”约定才保证 worker 看到的仍是本请求。
         self._pending_saves[req_id] = _PendingSave(
             req_id=req_id,
             token_ids=torch.tensor(token_ids, dtype=torch.long),

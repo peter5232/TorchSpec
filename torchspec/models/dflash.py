@@ -50,6 +50,9 @@ def _dpace_position_weights(confidences: torch.Tensor, alpha: float) -> torch.Te
     with torch.no_grad():
         # alpha=1 时每个平滑概率为 1，反向累计给早槽更大权重；alpha=0 时完全依据模型当前置信度。
         smoothed = (1.0 - alpha) * confidences.float() + alpha
+        # 若两槽置信度为 [0.6,0.2] 且 alpha=0.5，平滑后 [0.8,0.6]，
+        # 前缀质量 [0.8,0.48]，反向累和 [1.28,0.48]；权重大于 1 合法，它不是概率。
+        # 早槽会影响所有更长可接受前缀，因此累加其后各个前缀质量，而非只看本槽置信度。
         prefix_products = torch.cumprod(smoothed, dim=-1)
         weights = torch.flip(
             torch.cumsum(torch.flip(prefix_products, dims=[-1]), dim=-1),
@@ -100,6 +103,9 @@ def _create_dflash_mask_mod(
         kv_offset = (kv_idx - ctx_len) % block_size
         if is_causal:
             mask_draft = mask_draft & (kv_offset <= q_offset)
+        # is_causal 控制方向，sliding_window 控制距离，两者不是互斥后端。
+        # 如 anchor=4,q_offset=1,W=3：context 只剩位置 3；同块位置 4/5/6
+        # 在双向策略均可见，因果策略再去掉 6；严格 <W 意味距离恰为 W 也被遮住。
         if sliding_window is not None:
             query_position = anchor_pos + q_offset
             mask_context = mask_context & (query_position - kv_idx < sliding_window)
@@ -184,6 +190,8 @@ class DFlashModel(nn.Module):
         context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
         draft_position_ids = anchor_positions.unsqueeze(-1) + offsets
+        # 对 S=8,N=2,K=3,anchors=[2,5]：draft 内存槽 [0,1,2,3,4,5]
+        # 映射文本位置 [2,3,4,5,6,7]；若锚点重叠，位置可重复，但两块仍各自隔离。
         draft_position_ids = draft_position_ids.view(bsz, -1)
 
         return context_position_ids, draft_position_ids
@@ -215,6 +223,9 @@ class DFlashModel(nn.Module):
         valid_anchor_positions = anchor_positions.clamp(0, seq_len - 1)
         anchor_tokens = torch.gather(input_ids, 1, valid_anchor_positions)
 
+        # 如 token_ids=[10,11,12,13,14,15,16,17]、anchors=[2,5]，
+        # 写入后为 [12,M,M,15,M,M]。advanced indexing 同时定位 batch 和块首，
+        # 不会把第一个样本的 anchor token 广播到整个 batch；M 是真正的词表 MASK id。
         flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n)
         noise_ids[flat_batch_idx, block_starts] = torch.where(
             block_keep_mask,
@@ -307,6 +318,9 @@ class DFlashModel(nn.Module):
         # 5. Create block-causal attention mask
         # 物理长度用于 mask 维度；RoPE 位置来自 anchor，不能把物理下标 q_idx 当成文本绝对位置。
         draft_len = n_blocks * self.block_size
+        # S=8,N=2,K=3 时 Q 有 6 行、KV 有 14 行；第二块 Q=3..5 对应 KV=11..13。
+        # attention 在 draft 模型中给 context 和 draft 各投影 K/V 后拼接；
+        # 因此这里必须加上 context 长度，不能用 6x6 的普通 self-attention mask。
         kv_len = seq_len + draft_len
 
         # CPU 路径没有构建块掩码，draft 的 fallback 无因果/块间隔离；CPU 前向不能作为此训练掩码的正确性证据。
@@ -431,6 +445,9 @@ class DFlashModel(nn.Module):
             safe_label_indices,
         )
         # 块有效、序列内、非 anchor、原始监督四项相乘；每项含义独立，去掉任何一项都会引入错误监督。
+        # 例如合法块 a=2,K=3，原始监督在位置 2/3/4 为 [1,1,0]，最终为 [0,1,0]；
+        # 这里逐槽相乘，不要求其后监督连续。K=4 且为 [1,1,0,1] 时，最终是 [0,1,0,1]，
+        # 不能把 DSpark/selector 的连续前缀 cumprod 规则直接套到这个基础 DFlash 目标。
         weight_mask = weight_mask * original_loss_mask_gathered
 
         # Capture binary mask BEFORE applying objective weights. Accuracy measures
@@ -459,6 +476,9 @@ class DFlashModel(nn.Module):
             tgt_idx = (safe_label_indices - 1).clamp(min=0)  # [B, n_blocks, block_size]
             hdim = last_hidden_states.size(-1)
             gather_idx = tgt_idx.reshape(bsz, -1, 1).expand(-1, -1, hdim)
+            # a=2,K=3 的标签坐标 [2,3,4] 对应教师状态 [h1,h2,h3]；
+            # [B,N,K] 索引展为 [B,N*K,1] 再沿 Ht 广播，输出 [B,N*K,Ht]，
+            # 与 flat_logits 的块优先顺序一致。槽 0 虽也被 gather，最终仍被零权重排除。
             aligned_hidden = torch.gather(last_hidden_states, 1, gather_idx)
             target_logits = F.linear(aligned_hidden, lm_head_weight).view(-1, vocab_size)
             # L1 在概率空间而不是 logits 空间比较；float32 softmax 减少大词表下小概率累计误差。
@@ -496,6 +516,8 @@ class DFlashModel(nn.Module):
         flat_weights = objective_weights.view(-1)
         loss_numerator = (loss_per_token * flat_weights).sum()
         # 分母是权重和而非有效 token 个数；累积窗口内先加分子/分母再相除，与平均 micro-batch loss 不等价。
+        # 两个有效槽 CE=[2,4]、权重=[1,0.5] 时 numerator=4,denominator=1.5，
+        # loss=8/3；不是除以 token 数得到 2。准确率分母仍是这两个有效槽。
         loss_denominator = flat_weights.sum()
         # 附加项必须返回可累加分子；DFlash2 selector 共用外层优化分母，不能先求 selector 局部均值再相加。
         extra_numerator, loss_components = self._extra_training_loss(

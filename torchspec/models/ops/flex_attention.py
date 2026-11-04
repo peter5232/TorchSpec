@@ -163,6 +163,9 @@ def generate_eagle3_mask(Q_LEN: int, KV_LEN: int, lck: int = 0):
     def suffix_mask(b, h, q_idx, kv_idx):
         return (kv_idx >= Q_LEN) & ((kv_idx - q_idx) % Q_LEN == 0)
 
+    # 用 Q_LEN=4,KV_LEN=12 手算：q=1 可见 kv=[0,1,5,9]，
+    # 分别为首轮上下文槽 0/1、第二/三轮同槽 1；kv=4 虽更早写入却属于另一条链。
+    # suffix 的余数判断在物理缓存坐标上进行，不是 RoPE 的文本位置比较。
     mask_mod = or_masks(causal_mask, suffix_mask)
     mask_mod.__name__ = f"eagle3_mask_Q_{Q_LEN}_KV_{KV_LEN}_lck_{lck}"
     return mask_mod
@@ -218,6 +221,9 @@ def _build_eagle3_block_mask_tensors(
     col_kv = torch.arange(n_kv, device=device, dtype=torch.int32).unsqueeze(0)
 
     # FULL: kj in [0, qi*r) (causal-below-diagonal).
+    # 缩小为 Q_LEN=8,KV_LEN=16,Q_BS=4,KV_BS=2：共 2 个 Q 块、8 个 KV 块。
+    # Q 块 qi=1 覆盖 token 4..7；首轮 KV 块 0/1 覆盖 token 0..3，
+    # 每个 query 都可读它们，所以 FULL=[0,1]，无需在这些块逐 token 判断 causal。
     full_kv_num_1d = (qi * r).to(torch.int32)
     full_kv_idx_2d = torch.where(
         col_kv < full_kv_num_1d.unsqueeze(1),
@@ -228,6 +234,9 @@ def _build_eagle3_block_mask_tensors(
     # PARTIAL: r diagonal + r * (n_rounds - 1) suffix per Q-block.
     # Round s in [0, n_rounds): kj in [qi*r + s*n_kv_causal, (qi+1)*r + s*n_kv_causal).
     # 例如 Q_BS=256、KV_BS=128、两轮时，每个 Q 块有 4 个 PARTIAL KV 块；其余首轮下三角块为 FULL。
+    # 续上例 qi=1 的 PARTIAL=[2,3,6,7]；数组总宽仍是 8，后四项填零且 count=4。
+    # 首轮块 2/3 中有些 token 对非法；后续块 6/7 更只有同槽对角合法。
+    # 将 PARTIAL 当 FULL 会让其他预测链的 hidden 泄入当前链，而不只是多算一些 FLOPs。
     partial_count = r * n_rounds
     s_b = col_kv // r  # which round
     sub_b = col_kv % r  # offset within round
@@ -255,6 +264,9 @@ def _build_eagle3_block_mask_tensors(
         q_idx_diag.unsqueeze(1).expand(n_kv, n_q),
         torch.zeros_like(col_q).expand(n_kv, n_q),
     )
+    # 反向索引把同一张可见关系转置：上例 KV 块 0 的 PARTIAL Q=[0],FULL Q=[1]；
+    # KV 块 6 则 PARTIAL Q=[1],FULL Q=[]。dK/dV 要收集所有读过它的 query 梯度，
+    # 不能只保留前向的 Q->KV 索引而忽略这份 KV->Q 关系。
     q_num_1d = torch.ones(n_kv, dtype=torch.int32, device=device)
 
     # FULL: causal kj has (n_q - 1 - kj//r) full Q-blocks (qi > kj//r); suffix has 0.

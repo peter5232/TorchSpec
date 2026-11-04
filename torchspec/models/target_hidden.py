@@ -81,10 +81,15 @@ def capture_final_norm_boundary(decoder: nn.Module, **forward_kwargs) -> FinalNo
         for handle in handles:
             handle.remove()
 
+    # 四份张量即使都是 [B,S,H] 也不能仅凭 shape 判等：这里验证的是数值和调用边界。
+    # 对 RMSNorm，重复应用一般不幂等（可学习的逐通道权重尤其如此）；
+    # 把 pre_norm 直接送 head 或把 post_norm 再 norm 一次，都会改变教师监督分布。
     pre_norm = captured["pre_norm"]
     post_norm = captured["post_norm"]
     if not torch.equal(pre_norm, captured["block"]):
         raise RuntimeError("final-norm input is not the last decoder block's output")
+    # 此时 hook 已被移除，重算 norm 不会覆盖 captured；torch.equal 是逐元素精确比较，
+    # 用来检验同一次确定性 norm 的重放，不是跨后端数值误差容忍测试。
     if not torch.equal(decoder.norm(pre_norm), post_norm):
         raise RuntimeError("re-applying the final norm does not reproduce its captured output")
     # 若两侧完全相等，无法证明抓到了可区分边界，主动拒绝给调用方一个看似可靠的判定。
@@ -92,4 +97,5 @@ def capture_final_norm_boundary(decoder: nn.Module, **forward_kwargs) -> FinalNo
         raise RuntimeError("final norm is an identity on this input; boundary is not observable")
     if not torch.equal(output.last_hidden_state, post_norm):
         raise RuntimeError("decoder output is not the final norm's output")
+    # detach 只切断 autograd，不复制底层存储；返回值也不是任意后续原地修改的独立快照。
     return FinalNormBoundary(pre_norm=pre_norm.detach(), post_norm=post_norm.detach())

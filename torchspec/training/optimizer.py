@@ -62,6 +62,9 @@ class BF16Optimizer:
         self.max_grad_norm = max_grad_norm
         # 每个可训练参数对应一个独立 FP32 master，detach 避免这次拷贝进入计算图。
         # 前向仍使用原模型参数，AdamW 操作的是 master；梯度需在 step 中显式复制过去。
+        # 直观例子：BF16 在 1 附近的相邻可表示值相差约 0.0078125。
+        # 单次 0.001 量级更新可能在回写时被舍入，但 master 保留它，多个小更新可逐步累积，
+        # 而每步直接修改 BF16 参数可能把这些变化反复舍掉；这与 loss scaling 是两件事。
         self.fp32_params = [p.detach().clone().to(torch.float32) for p in self.model_params]
         # 持久梯度 buffer 避免每步反复分配 FP32 存储。
         # 没有模型梯度的参数设 mp.grad=None，不把上步 buffer 残留值误当成本步新梯度。
@@ -110,6 +113,8 @@ class BF16Optimizer:
                     grad_sources.append(p.grad)
                     mp.grad = g
                 else:
+                    # None 表示本步完全未参与该参数的更新，AdamW 连其动量/衰减也不推进。
+                    # 与数值全零梯度不同：零梯度仍可被历史动量或 weight decay 推动。
                     mp.grad = None
             if grad_destinations:
                 _copy_tensors_(grad_destinations, grad_sources)
@@ -134,6 +139,9 @@ class BF16Optimizer:
         self.optimizer.found_inf = found_inf
         self.optimizer.step()
 
+        # 两份 .grad 属于不同对象：此调用清 master.grad，末尾循环才清 model.grad。
+        # fp32_grads 列表仍持有实际 buffer，下一窗口用 copy_ 覆盖；释放 .grad 引用
+        # 不等于释放这块持久存储，也不是把模型参数数值清零。
         self.optimizer.zero_grad()
         # 即使 found_inf 让 fused AdamW 跳过更新，这里的调度步仍然推进；读曲线时需注意这一约定。
         self.scheduler.step()

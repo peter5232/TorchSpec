@@ -169,6 +169,9 @@ class DFlashTrainer(Trainer):
 
         dflash_model = self._build_training_wrapper(draft_model)
 
+        # 非零 rank 在 meta 上建模，只知道形状；barrier 仅对齐进度，不会传播权重值。
+        # 真正把 rank 0 的 teacher embedding/初始 draft 同步给其他 rank 的是下面的
+        # fsdp2_load_full_state_dict；因此不能用 barrier 代替该状态加载步骤。
         full_state = dflash_model.state_dict() if dist.get_rank() == 0 else {}
 
         dflash_model = apply_fsdp2(
@@ -243,6 +246,9 @@ class DFlashTrainer(Trainer):
             raise ValueError(
                 "target_lm_head is required but was None. Ensure _init_target_lm_head succeeded."
             )
+        # 冻结 W 不等于禁用 F.linear 的 autograd：draft logits = h @ W.T，
+        # 仍需通过固定 W 把 dL/dlogits 传回 h，即 dL/dh = dL/dlogits @ W。
+        # 因此这里只冻结 head 权重，不能把整个 draft→logits→loss 放进 no_grad。
         self.target_lm_head_weight = self.target_lm_head.lm_head.weight
 
         self.prof.on_init_end()
@@ -291,6 +297,9 @@ class DFlashTrainer(Trainer):
         along the last dimension. We split them back into a list of [B, seq_len, D] tensors.
         """
         total_dim = hidden_states.shape[-1]
+        # 这里没有校验 total_dim 能否整除层数，输入契约由配置和生产端共同保证。
+        # 例如 12 维/3 层得到 3 片各 4 维；13 维/3 层却会 split 出 4,4,4,1，
+        # 所以“函数返回 list”本身不能证明它恰好包含 num_target_layers 个合法层。
         per_layer_dim = total_dim // self.num_target_layers
         return list(hidden_states.split(per_layer_dim, dim=-1))
 
@@ -387,6 +396,9 @@ class DFlashTrainer(Trainer):
         all-zero ``loss_mask`` fallback in ``DFlashModel``) and must not cost a
         device-to-host sync on every optimizer step.
         """
+        # detach 阻断的是归一化分母的梯度路径；clone 另给 all_reduce 可原地修改的存储，
+        # 防止把本地累积计数覆盖成全局计数。D-PACE 的权重也已在模型中按 no_grad 构造，
+        # 本步骤优化的是“固定本次权重”的加权损失，不对权重选择策略本身求导。
         denominator = local_denominator.detach().clone()
         group = getattr(self, "dp_group", None)
         world_size = 1
@@ -441,6 +453,9 @@ class DFlashTrainer(Trainer):
         acc_key: str,
         count_key: str,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # 每份输入是 [block_size]，stack 后为 [microbatch数, block_size]。
+        # 同一槽位若两批均值 2、5，计数 3、1，则池化为 (2*3+5*1)/4=2.75，
+        # 不是 (2+5)/2=3.5；无监督位置 count=0，不应获得一个批次的投票权。
         loss_sum_pp = torch.stack([m[loss_key] * m[count_key] for m in all_step_metrics]).sum(dim=0)
         correct_sum_pp = torch.stack([m[acc_key] * m[count_key] for m in all_step_metrics]).sum(
             dim=0
@@ -542,6 +557,9 @@ class DFlashTrainer(Trainer):
         self.model.eval()
         all_metrics: list[dict] = []
         for i in range(0, len(self._eval_cache), eval_mbs):
+            # 缓存由 batch_size=1 的 fetcher 建立，但其中可能已经含长度分桶 padding。
+            # 此处只组合缓存项，不按 attention_mask 去 padding；collator 普通分支还会
+            # 重建 attention_mask。解释“无 padding 样本”的 docstring 时应以这条实际数据流为准。
             chunk = self._eval_cache[i : i + eval_mbs]
             batch = self._eval_collator(chunk)
             gpu_batch = {
@@ -635,6 +653,9 @@ class DFlashTrainer(Trainer):
         evt_fwd_e.record()
 
         # 跨 batch 长度/mask 不同，分母不能假设相同；只反向分子，待窗口结束统一除总分母。
+        # 对 base DFlash，分母是 objective_weights.sum()，未必是整数 token 数。
+        # 例如两个有效槽的权重为 1 和 0.5，CE 为 2 和 4，则分子=4、分母=1.5；
+        # count_per_position 仍各计 1，accuracy 也不因第二槽训练权重较小而减半计数。
         loss_numerator, loss_denominator = loss_terms
         # 累积窗口起点重置 denominator，后续 microbatch 原地相加。
         # 这里 detach 是因为分母只用于归一化计数，不应把它连接进训练计算图。

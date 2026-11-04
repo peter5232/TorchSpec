@@ -142,6 +142,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 if t.is_cuda:
                     t.record_stream(self._copy_stream)
 
+            # 到此主线程只完成“拷贝已排队”，并没有完成“CPU 字节就绪”或“远端键可读”。
+            # submit 把后两步交给线程；HFRunner 在整批末尾 flush，vLLM 则允许消费者等待键。
             self._async_put_manager.submit(
                 keys,
                 buffer_ptrs,
@@ -184,6 +186,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         if target_hs is None:
             raise ValueError("USP sharded Mooncake storage requires last_hidden_states or target")
 
+        # split_usp_batch 还负责训练展开所需的位置/重叠规则；不要用 torch.chunk(S, sp_size) 替代。
+        # 返回的 attention/loss/position 在这里不上传：该阶段只发布训练端会按相同规则解释的张量。
         if input_ids.dim() == 2:
             loss_mask_len = input_ids.shape[-1]
         else:
@@ -333,6 +337,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         self._ensure_initialized()
         if self._async_put_manager is None:
             return
+        # 已缓存错误会在 drain 前立刻抛出，所以“调用过 flush”本身不证明全部任务已排空；
+        # 只有正常返回才具备本次检查的成功语义，失败后的资源收尾仍由 close/shutdown 负责。
         self._async_put_manager.check_last_error()
         self._async_put_manager.drain()
         self._async_put_manager.check_last_error()
@@ -537,12 +543,17 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             numel = 1
             for dim in shape:
                 numel *= dim
+            # 接收区一直留在 setup 选择的 GPU；此方法没有按 device 参数迁移返回值。
+            # 调用者应让 store 的设备与消费设备一致；设备字符串不是网络地址或自动搬运指令。
             buf_slice = self._gpu_receive_buffer.get_slice(offsets[i], sizes[i])
             # View into the registered buffer; valid until the next call.
             # 这里没有 clone：所有返回字段都借用接收区。下一个请求到来会写同一分配，
             # 训练侧若需要跨多次 get 持有旧样本，必须在覆盖前把数据转移到独立存储。
             tensor_map[name] = buf_slice.view(dtype)[:numel].reshape(shape)
 
+        # 若要跨下一次 GET 保留这一层，不仅要 clone，还要等 clone 所在 CUDA stream 完成：
+        # 下一次网卡写接收区不受 CUDA 排队约束。训练侧 _clone_fragment_before_receive_buffer_reuse
+        # 正是为逐层读取做这个同步；仅 record_stream 不能阻止外部网卡覆盖仍在读取的内存。
         logger.debug("GPU Direct RDMA transfer successful for %s tensors", len(keys))
         return tensor_map
 
@@ -572,6 +583,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
         # 即便元数据已经可见，字节获取仍可能暂时缺项，因此此处保留独立的批量 get 重试。
         while True:
+            # 每轮重取整组，先前返回的部分 buffers 不拼接进新结果；成功路径才统一解释本轮字段。
+            # 例如 hs 已到而 ids 缺失时，本轮不会提前返回 hs 给训练循环。
             buffers = self._store.batch_get_buffer(keys)
             missing = [i for i, buf in enumerate(buffers) if buf is None]
             if not missing:
@@ -693,4 +706,5 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             else:
                 logger.error("Force delete abandoned for %s: %s", key, failed)
                 return
+            # 首轮 [hs=成功, ids=失败] 后只保留 ids；后续日志的 keys 已不是原始完整样本键集合。
             keys = [k for k, _ in failed]

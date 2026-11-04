@@ -87,6 +87,8 @@ class DeferredTrainMetrics:
         else:
             self.ready_event.synchronize()
 
+        # pinned 只让异步复制成为可能，不保证 CPU 已能读到新值；上面的事件等待才是读取屏障。
+        # source_values 即使不再用于计算也必须存活到此，避免复制仍在读它时存储被缓存分配器复用。
         metrics = self.finalize_values(self.cpu_values.tolist())
         metrics["_metrics_step"] = self.metric_step
 
@@ -161,6 +163,8 @@ class Trainer(abc.ABC):
     def _setup_device_mesh(self) -> None:
         world_size = dist.get_world_size()
         rank = dist.get_rank()
+        # 缓存文件按全局 rank 命名：USP 下不同 SP rank 可以有相同 dp_rank，
+        # 却持有不同序列片段，用 dp_rank 命名会让它们写到同一个文件。
         self.cache_rank = rank
 
         usp_mesh = None
@@ -347,6 +351,9 @@ class Trainer(abc.ABC):
 
     # 从评估 fetcher 最多消费 count 个元素，把张量移到 CPU 后追加缓存，返回累计缓存数。
     def cache_eval_samples(self, count: int) -> int:
+        # 这里的 sample 已经过 DataLoader/collator，不是 store 中的原始变长张量。
+        # controller/setup.py 固定评估 fetcher 的 batch_size=1，所以一项对应一条序列，
+        # 但普通路径仍可能已补到 128 的倍数；后续重新 collate 不会恢复原始长度。
         for sample in itertools.islice(self._eval_data_fetcher, count):
             cpu_sample = {
                 k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in sample.items()
@@ -421,6 +428,8 @@ class Trainer(abc.ABC):
                 step_end.record()
                 metrics.step_events = (step_start, step_end)
             # 先完成本步 CUDA 提交再读取上步 CPU buffer；等待上步事件可与本步设备计算重叠。
+            # 例如提交 step=7 时兑现 step=6，返回字典中的 _metrics_step 才是日志归属。
+            # 控制器据它匹配等待时间；不能把本次 RPC 的 step 直接当作返回指标的 step。
             previous_metrics = self._pending_train_metrics
             self._pending_train_metrics = metrics
             metrics = previous_metrics.finalize() if previous_metrics is not None else {}
@@ -448,6 +457,9 @@ class Trainer(abc.ABC):
         all micro-batches.  ``global_step`` counts optimizer steps.
         """
         self.model.train()
+        # 控制器按 queued_batches 凑齐 K 个 microbatch 后才调用本入口。
+        # 例如每个 DP rank 的 batch_size=2、K=3，正常窗口每个副本消费 6 条样本，
+        # 做 3 次 backward、1 次 step；这里的 num_batches 不是样本数或生成 token 数。
         accumulation_steps = num_batches
 
         all_step_metrics: list[dict] = []
@@ -516,6 +528,8 @@ class Trainer(abc.ABC):
                 evt_end.record()
                 compute_events.append((evt_start, evt_end))
 
+            # 基类会持有窗口里所有统计直到汇总。子类应返回 detach 的统计或纯事件，
+            # 不应把需要梯度的 logits/hidden 整块塞进字典，否则会延长激活/计算图对象的生命期。
             all_step_metrics.append(step_metrics)
 
             if perf:

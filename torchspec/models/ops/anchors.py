@@ -39,9 +39,13 @@ def _candidates(seq_len: int, loss_mask: torch.Tensor, block_size: int, device: 
     supervised token yields no gradient.
     """
     bsz = loss_mask.shape[0]
+    # 对 S=8,K=3，最大候选是位置 5，候选索引为 0..5；另一个上界 S-1 排除无后继的尾 token。
+    # 这里选的是块起点，不是在序列中任取 K 个位置；块内各深度目标由模型另行构造。
     max_anchor = max(seq_len - block_size, 0)
     num_candidates = min(max_anchor + 1, seq_len - 1)
 
+    # 只检查 a 和 a+1 都监督，不保证后面整块都监督。例 mask=[0,1,1,0,1,1,1,0]，
+    # S=8,K=3 时候选为 a=1,4,5；a=1 后面会遇到断点，后续深度仍需模型自己的目标 mask。
     valid = (loss_mask[:, :num_candidates] > 0.5) & (loss_mask[:, 1 : num_candidates + 1] > 0.5)
     indices = torch.arange(num_candidates, device=device).unsqueeze(0).expand(bsz, -1)
     return num_candidates, valid, valid.sum(dim=1), torch.where(valid, indices, seq_len + 1)
@@ -103,6 +107,8 @@ def sample_anchor_positions(
         keep_mask: [B, num_anchors] — True for valid sampled anchors
     """
     bsz = loss_mask.shape[0]
+    # 当前实现把 S<=K 一律视为短序列，连 S==K 也走 dummy 分支；这是实际判断的边界。
+    # dummy 的位置 0 只是合法 gather 地址，keep=False 才表达“不应产生监督”，二者必须一起传。
     if max(seq_len - block_size, 0) == 0:
         return _empty(bsz, num_anchors, seq_len, block_size, device)
 
@@ -121,6 +127,8 @@ def sample_anchor_positions(
     # each one is picked with probability num_anchors / valid_count exactly as uniform
     # sampling would. Drawing the phase over the leftover slack instead would pick the
     # middle of a sample far more often than its ends.
+    # 一条样本有效位置若是 [1,4,5]，以下 rank 的 0/1/2 指这个列表的下标，而非原 token ID。
+    # valid_count=0 时用 1 只为避免模零；最终 keep_mask 全 False，不凭空添加有效锚点。
     counts = valid_counts.unsqueeze(1).clamp(min=1)
     # 预算足够时步长为1；预算较小时尽量铺开，但不能超过 max_gap+1，从而控制每个 token 的深度覆盖。
     stride = (valid_counts // num_anchors).clamp(min=1, max=max_gap + 1).unsqueeze(1)
@@ -129,6 +137,9 @@ def sample_anchor_positions(
 
     slot = torch.arange(num_anchors, device=device).unsqueeze(0)
     # num_anchors * stride <= valid_count by construction, so the wrap never collides.
+    # 手算：有 6 个候选、N=3、stride=2、offset=5，则 rank=[5,1,3]。
+    # 所以原 docstring 的 sorted 不适用于回绕后的槽顺序；原 token 位置要再通过 ordered.gather 获得。
+    # 若候选原位置为 [1,2,6,7,8,9]，上述采样得到 [9,2,7]；rank 间隔不等于 token 间隔。
     rank = (offset + slot * stride) % counts
     # 有效数<N 时 rank 会取模重复，但这些重复槽被 keep_mask 禁用；固定形状与真实监督数量由两张张量分工。
     keep_mask = slot < valid_counts.unsqueeze(1)

@@ -67,3 +67,11 @@ python3 -m pytest tests/test_ci_convergence.py tests/test_target_hidden.py tests
 2026-11-04 补充验证：通过 uv 隔离工具环境运行完整的 `pre-commit run --all-files`（命令为 `uv tool run --from pre-commit pre-commit run --all-files`）。首次运行修正了两处注释相关格式，修正后重新运行，全部适用 hooks 通过（无符号链接可检查的 hook 跳过）；AST、有效 token、语法编译和 535 个本地链接再次验证通过。未安装全局依赖。
 
 另以 `python3 -m unittest discover -s tests -p test_ci_convergence.py -v` 执行不依赖 PyTorch 的现有收敛轨迹测试，2 项通过。该结果不替代上面受阻的 PyTorch 测试。
+
+## 第二轮：实现内部的深入演算
+
+在首轮提交 `f51a04a` 上继续深化 15 个核心 Python 文件，增加 257 行中文注释，重点是函数体内的张量变换、坐标与字节布局、梯度通路和异步完成边界。新增三篇配套演算：监督与损失、模型小张量、跨进程传输时序；入口均在主阅读指南。
+
+本轮修改与 `f51a04a` 的 AST、有效 token 完全相同，15 个修改文件均可编译；全部教程的 556 个本地链接有效。完整 pre-commit hooks 通过，两个现有收敛轨迹测试再次通过。手算例子的 CE、熵、KL、概率重合质量和锚点回绕结果另以标准库复算，并交叉核对源码。
+
+这些例子是帮助理解实现的推导，不是 GPU kernel 或真实网络传输的运行结果。本轮未重新运行此前受 OpenMP 环境冲突阻塞的 PyTorch 测试，也未改变预取结束、缓存 padding 或异步错误处理等现有行为。

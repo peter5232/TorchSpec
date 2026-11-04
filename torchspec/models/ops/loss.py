@@ -28,12 +28,18 @@ import torch.nn.functional as F
 
 # float32 中算 logsumexp(z)-sum(p*z)，即 -sum(p log q)，不显式存 log_softmax 张量。
 def _forward_kl_from_logits(logits: torch.Tensor, target_p: torch.Tensor) -> torch.Tensor:
+    # q=softmax(z) 时 log q_i=z_i-logsumexp(z)，且 sum(p)=1，故 CE 可写成下面两项。
+    # 前提是 target_p 在最后一维已归一化；直接传裁剪后未归一化的 p 会漏掉质量系数。
+    # 对 z 的梯度为 q-p；KL(p||q)=CE-H(p)，冻结 teacher 时二者梯度相同、日志值不同。
+    # 例 p=[0.75,0.25]、q=[0.5,0.5]：CE=log(2)，梯度=[-0.25,0.25]。
     logits_f32 = logits.float()
     return torch.logsumexp(logits_f32, dim=-1) - (target_p * logits_f32).sum(-1)
 
 
 # 先转 float32，用 exp(z-logsumexp(z)) 求概率，稳定处理大 logits 并避免低精度归一化误差。
 def _softmax_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    # 减去 logsumexp 后再 exp，避免直接 exp(1000) 这类溢出；它与 softmax 的数学定义相同。
+    # float() 保留 autograd 链，不是 detach；这里只改变计算精度，不决定 teacher 是否冻结。
     logits_f32 = logits.float()
     return torch.exp(logits_f32 - torch.logsumexp(logits_f32, dim=-1, keepdim=True))
 
@@ -45,6 +51,9 @@ def _project(
     lm_head_up: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """Draft logits. ``lm_head_up`` is None for a dense head, the up projection otherwise."""
+    # F.linear(x,W) 实际算 x @ W.T：dense W=[V,H] 将 [N,H] 映到 [N,V]。
+    # 低秩时第一个 W=[R,H]，第二个 up=[V,R]；中间 [N,R] 的 R 是秩，不是 token 数。
+    # 分两次矩阵乘法避免显式构造 [V,H] 的乘积权重，但最终 [N,V] logits 仍然存在。
     logits = F.linear(hidden, lm_head_weight)
     if lm_head_up is not None:
         logits = F.linear(logits, lm_head_up)
@@ -59,6 +68,9 @@ def _rmsnorm_logits(
     lm_head_up: Optional[torch.Tensor],
     norm_eps: float,
 ) -> torch.Tensor:
+    # RMSNorm 不像 LayerNorm 那样减均值。每一行独立算 mean(h*h)，不跨 token 或 batch 混合。
+    # h=[3,4]、忽略 eps、gamma=[1,1] 时，除数是 sqrt(12.5)，不是标准差 0.5。
+    # 先将归一化结果转回输入 dtype 再乘 gamma，顺序影响舍入；解读时不能任意交换。
     hs_f32 = hs_flat.float()
     variance = hs_f32.pow(2).mean(-1, keepdim=True)
     rstd = torch.rsqrt(variance + norm_eps)
@@ -77,6 +89,9 @@ def compiled_sum_forward_kl_loss(
     lm_head_up,
     norm_eps,
 ):
+    # 展平行号 r=b*T+t。例 B=2,T=3，valid_idx=[1,5] 对应 (0,1) 与 (1,2)。
+    # 两侧用同一索引取 [N,H] / [N,V] 或 [N,Htarget]，否则形状正确也会监督错 token。
+    # gather 的 backward 会把所选行的梯度散回原行；未选行不通过此损失贡献梯度。
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
     tp = target_p_flat.index_select(0, valid_idx)
 
@@ -117,6 +132,9 @@ def compiled_forward_kl_loss(
         lm_head_weight: (V_out, H) — draft lm_head weight
         norm_eps: float
     """
+    # 展平行号 r=b*T+t。例 B=2,T=3，valid_idx=[1,5] 对应 (0,1) 与 (1,2)。
+    # 两侧用同一索引取 [N,H] / [N,V] 或 [N,Htarget]，否则形状正确也会监督错 token。
+    # gather 的 backward 会把所选行的梯度散回原行；未选行不通过此损失贡献梯度。
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
     tp = target_p_flat.index_select(0, valid_idx)
 
@@ -160,6 +178,9 @@ def compiled_lk_alpha_loss(
     paper (out-of-draft-vocab mass must contribute 0, not be redistributed).
     ``coverage_flat`` is 1 when there is no vocab pruning, leaving ``tp`` unchanged.
     """
+    # 展平行号 r=b*T+t。例 B=2,T=3，valid_idx=[1,5] 对应 (0,1) 与 (1,2)。
+    # 两侧用同一索引取 [N,H] / [N,V] 或 [N,Htarget]，否则形状正确也会监督错 token。
+    # gather 的 backward 会把所选行的梯度散回原行；未选行不通过此损失贡献梯度。
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
     tp_tilde = target_p_flat.index_select(0, valid_idx)
     coverage = coverage_flat.index_select(0, valid_idx)
@@ -167,8 +188,14 @@ def compiled_lk_alpha_loss(
     logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, lm_head_up, norm_eps)
     q = _softmax_from_logits(logits)
 
+    # coverage=[N] 扩成 [N,1]，逐行恢复保留词表的真实概率质量，不沿 token 轴相乘。
+    # 例完整 p=[0.5,0.2,0.3]、只保留前两词：tp_tilde=[5/7,2/7]，coverage=0.7。
+    # q=[0.6,0.4] 时 alpha=min(0.5,0.6)+min(0.2,0.4)=0.7；第三词的 q 为零。
+    # 此处的 alpha 是分布重合质量，不是这批 token top-1 准确率，也不是实际接受长度。
     tp = tp_tilde * coverage.unsqueeze(-1)
     alpha = torch.min(tp, q).sum(-1)
+    # clamp 防止 log(0)；低于阈值的区间经过 clamp 后不再提供 alpha 方向的梯度。
+    # alpha 是逐 token 的 [N]，先取 -log 再求和；不等同于对平均 alpha 取一次 -log。
     token_loss = -torch.log(alpha.clamp(min=1e-8))
     correct = (logits.argmax(-1) == tp_tilde.argmax(-1)).float()
     count = torch.ones_like(token_loss, dtype=torch.float32).sum()
@@ -209,6 +236,9 @@ def compiled_lk_lambda_loss(
     when there is no sequence sharding, in which case the local mean already
     covers the whole depth.
     """
+    # 展平行号 r=b*T+t。例 B=2,T=3，valid_idx=[1,5] 对应 (0,1) 与 (1,2)。
+    # 两侧用同一索引取 [N,H] / [N,V] 或 [N,Htarget]，否则形状正确也会监督错 token。
+    # gather 的 backward 会把所选行的梯度散回原行；未选行不通过此损失贡献梯度。
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
     tp_tilde = target_p_flat.index_select(0, valid_idx)
     coverage = coverage_flat.index_select(0, valid_idx)
@@ -220,6 +250,9 @@ def compiled_lk_lambda_loss(
     tp = tp_tilde * coverage.unsqueeze(-1)
     alpha = torch.min(tp, q).sum(-1)
     mean_alpha = external_mean_alpha if external_mean_alpha is not None else alpha.mean()
+    # lambda 是本次深度共享的标量。detach 阻止模型通过改变混合权重来“钻目标的空子”，
+    # 梯度仍可经下方 KL/TV 流向 q；lambda 的数值则会随下一次前向的 alpha 更新。
+    # eta>0 时 alpha 越高 lambda 越小，TV 权重越大；eta=0 时退化为纯 KL。
     lam = torch.exp(-eta * mean_alpha.detach())
 
     kl = F.kl_div(log_q, tp_tilde, reduction="none").sum(-1)
@@ -245,9 +278,15 @@ def compiled_sum_forward_kl_loss_from_hs(
     target_lm_head_weight,
     norm_eps,
 ):
+    # 展平行号 r=b*T+t。例 B=2,T=3，valid_idx=[1,5] 对应 (0,1) 与 (1,2)。
+    # 两侧用同一索引取 [N,H] / [N,V] 或 [N,Htarget]，否则形状正确也会监督错 token。
+    # gather 的 backward 会把所选行的梯度散回原行；未选行不通过此损失贡献梯度。
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
     ths = target_hidden_states_flat.index_select(0, valid_idx)
 
+    # 教师 head 接受的是已符合其 final-norm 契约的 ths；此处不会替教师再做 RMSNorm。
+    # 只为 N 个有效位置生成 [N,Vfull]，省掉无效位置的词表投影；并非完全不物化 logits。
+    # 教师权重与特征都应由调用链冻结：仅冻结 W 并不能阻止梯度流向 requires_grad 的 ths。
     target_logits = F.linear(ths, target_lm_head_weight)
     tp = _softmax_from_logits(target_logits)
 
@@ -276,9 +315,15 @@ def compiled_lk_alpha_loss_from_hs(
     norm_eps,
 ):
     """LK^alpha loss from hidden states (LazyTarget path). See ``compiled_lk_alpha_loss``."""
+    # 展平行号 r=b*T+t。例 B=2,T=3，valid_idx=[1,5] 对应 (0,1) 与 (1,2)。
+    # 两侧用同一索引取 [N,H] / [N,V] 或 [N,Htarget]，否则形状正确也会监督错 token。
+    # gather 的 backward 会把所选行的梯度散回原行；未选行不通过此损失贡献梯度。
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
     ths = target_hidden_states_flat.index_select(0, valid_idx)
 
+    # 教师 head 接受的是已符合其 final-norm 契约的 ths；此处不会替教师再做 RMSNorm。
+    # 只为 N 个有效位置生成 [N,Vfull]，省掉无效位置的词表投影；并非完全不物化 logits。
+    # 教师权重与特征都应由调用链冻结：仅冻结 W 并不能阻止梯度流向 requires_grad 的 ths。
     target_logits = F.linear(ths, target_lm_head_weight)
     tp = _softmax_from_logits(target_logits)
 
@@ -286,6 +331,8 @@ def compiled_lk_alpha_loss_from_hs(
     q = _softmax_from_logits(logits)
 
     alpha = torch.min(tp, q).sum(-1)
+    # clamp 防止 log(0)；低于阈值的区间经过 clamp 后不再提供 alpha 方向的梯度。
+    # alpha 是逐 token 的 [N]，先取 -log 再求和；不等同于对平均 alpha 取一次 -log。
     token_loss = -torch.log(alpha.clamp(min=1e-8))
     correct = (logits.argmax(-1) == target_logits.argmax(-1)).float()
     count = torch.ones_like(token_loss, dtype=torch.float32).sum()
@@ -308,9 +355,15 @@ def compiled_lk_lambda_loss_from_hs(
 ):
     """LK^lambda loss from hidden states (LazyTarget path). See
     ``compiled_lk_lambda_loss`` for ``external_mean_alpha``'s role under USP."""
+    # 展平行号 r=b*T+t。例 B=2,T=3，valid_idx=[1,5] 对应 (0,1) 与 (1,2)。
+    # 两侧用同一索引取 [N,H] / [N,V] 或 [N,Htarget]，否则形状正确也会监督错 token。
+    # gather 的 backward 会把所选行的梯度散回原行；未选行不通过此损失贡献梯度。
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
     ths = target_hidden_states_flat.index_select(0, valid_idx)
 
+    # 教师 head 接受的是已符合其 final-norm 契约的 ths；此处不会替教师再做 RMSNorm。
+    # 只为 N 个有效位置生成 [N,Vfull]，省掉无效位置的词表投影；并非完全不物化 logits。
+    # 教师权重与特征都应由调用链冻结：仅冻结 W 并不能阻止梯度流向 requires_grad 的 ths。
     target_logits = F.linear(ths, target_lm_head_weight)
     tp = _softmax_from_logits(target_logits)
 
@@ -324,6 +377,9 @@ def compiled_lk_lambda_loss_from_hs(
     # schedule — not per token (and, under USP, from external_mean_alpha —
     # the SP-group-reduced mean — rather than this rank's local shard alone).
     mean_alpha = external_mean_alpha if external_mean_alpha is not None else alpha.mean()
+    # lambda 是本次深度共享的标量。detach 阻止模型通过改变混合权重来“钻目标的空子”，
+    # 梯度仍可经下方 KL/TV 流向 q；lambda 的数值则会随下一次前向的 alpha 更新。
+    # eta>0 时 alpha 越高 lambda 越小，TV 权重越大；eta=0 时退化为纯 KL。
     lam = torch.exp(-eta * mean_alpha.detach())
 
     kl = F.kl_div(log_q, tp, reduction="none").sum(-1)
@@ -357,10 +413,16 @@ def compiled_forward_kl_loss_from_hs(
 
     Used for the non-pruning (LazyTarget) path where V_full is large.
     """
+    # 展平行号 r=b*T+t。例 B=2,T=3，valid_idx=[1,5] 对应 (0,1) 与 (1,2)。
+    # 两侧用同一索引取 [N,H] / [N,V] 或 [N,Htarget]，否则形状正确也会监督错 token。
+    # gather 的 backward 会把所选行的梯度散回原行；未选行不通过此损失贡献梯度。
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
     ths = target_hidden_states_flat.index_select(0, valid_idx)
 
     # Target probs (detached weights → no grad flows through target)
+    # 教师 head 接受的是已符合其 final-norm 契约的 ths；此处不会替教师再做 RMSNorm。
+    # 只为 N 个有效位置生成 [N,Vfull]，省掉无效位置的词表投影；并非完全不物化 logits。
+    # 教师权重与特征都应由调用链冻结：仅冻结 W 并不能阻止梯度流向 requires_grad 的 ths。
     target_logits = F.linear(ths, target_lm_head_weight)
     tp = _softmax_from_logits(target_logits)
 

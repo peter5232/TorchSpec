@@ -194,6 +194,8 @@ class Eagle3Model(nn.Module):
         # Important as it prevents recompilation.
         # 有效 token 数会随监督内容变化；标记这一维动态，避免每种 mask 非零数量触发重新编译。
         torch._dynamo.maybe_mark_dynamic(valid_idx, 0)
+        # 对 B=2,T=3，展平行依次是 (b0,t0..2),(b1,t0..2)；mask=[0,1,0;1,0,1]
+        # 得 valid_idx=[1,3,5]。draft 与 teacher 必须用同一行次序，不能各自筛选后假定还能对齐。
         hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
         is_lk = self.loss_type in ("lk_alpha", "lk_lambda")
 
@@ -302,6 +304,8 @@ class Eagle3Model(nn.Module):
         # 低秩头还需 lm_head_up；漏传第二段会把 rank 维误当词表维。
         norm_weight, lm_head_weight, norm_eps = self.draft_model.get_lm_head_params()
         lm_head_up = self.draft_model.get_lm_head_up_weight()
+        # 例如教师取三层、每层宽 8，则 [1,6,24] -> [1,6,Hdraft]；融合只做一次。
+        # 后续轮输入已经是 draft 宽度，若再投影不仅维度不符，也会重新注入教师特征。
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
         if past_key_values is not None:
@@ -364,6 +368,10 @@ class Eagle3Model(nn.Module):
         input_ids = input_ids.clamp(min=0, max=self.draft_model.target_vocab_size - 1)
 
         # 阶段二：同一 backbone 参数反复用于多个预测深度。cache_keys/values 跨轮保留，而不是每轮重新初始化。
+        # 按 Eagle3Trainer._forward 的左移约定，原 x0..x5 的槽 t=1：
+        # idx=0 读辅助特征 f1 + token x2，拟合 head(h2) 对 x3 的分布；
+        # idx=1 读上一轮预测 hidden + token x3，拟合 head(h3) 对 x4 的分布。
+        # position_ids 此处不逐轮加一：attention 内部按缓存轮数 lck 加偏移，避免加两次。
         for idx in range(self.length):
             is_last = idx == self.length - 1
 
@@ -414,6 +422,9 @@ class Eagle3Model(nn.Module):
                     use_cache=True,
                 )
 
+            # 输出仍有 T 个槽，每个槽是一条不同起点的预测链；不是只留下最后一个 token。
+            # Flex 后端第二轮的 KV 长度为 2*T，槽 t 读首轮 0..t 和本轮 t；
+            # KV 没有 detach，因此后续轮 loss 可经缓存回传到早先轮的同一组参数。
             hidden_states = hidden_states_out
 
             # 阶段四：loss 用本轮输出与偏移 idx 的教师目标比较；hidden 反馈 norm 在这之后，不能先改输出再重复 norm。
@@ -461,6 +472,8 @@ class Eagle3Model(nn.Module):
                 denom = reduced_count.clamp_min(1.0)
                 # 反向只持有本 rank 的 loss 分子，除以全 SP count；指标才使用全组已规约的分子。
                 # 不能把 reduced_sum_loss 这个 detach 统计量拿来 backward。
+                # 例：两 shard 的 (sum,count)=(6,2),(3,1)，全局指标是 9/3=3；
+                # 各自图上保留 6/3 与 3/3。不能平均局部均值，尤其 count 不相等时。
                 loss = (local_sum_loss / denom).to(loss.dtype)
                 metric_loss = (reduced_sum_loss / denom).detach()
                 metric_acc = (reduced_correct / denom).to(device=loss.device, dtype=torch.float32)
@@ -499,6 +512,8 @@ def compute_target_p_padded(
     chunk_size: int = 4096,
 ) -> PrecomputedTarget:
     target_lm_head_weight = target_lm_head_weight.detach()
+    # 若全词表有 5 行且 t2d=[F,T,F,T,F]，得到 head 的第 1、3 行；
+    # 之后概率最后一维的下标 0/1 表示教师 token 1/3，并非教师 token 0/1。
     pruned_weight = target_lm_head_weight[t2d]
 
     bsz, seq_len, hidden_size = target_hidden_states.shape
@@ -538,6 +553,8 @@ def compute_target_p_padded(
         # sync to read back the True-count, and that would otherwise happen
         # once per chunk instead of once per call.
         chunk_pruned_logits = F.linear(chunk_hs, pruned_weight)
+        # 例：全分布 [0.1,0.5,0.1,0.2,0.1]，保留 token 1/3 的质量是 0.7；
+        # 下方单独 softmax 的结果为 [5/7,2/7]。LK 用它乘 0.7 才还原 [0.5,0.2]。
         full_logsumexp = torch.logsumexp(chunk_full_logits.float(), dim=-1)
         pruned_logsumexp = torch.logsumexp(chunk_pruned_logits.float(), dim=-1)
         # 用两个 log-normalizer 的差求子词表质量，避免对低概率词直接求和时损失精度。
