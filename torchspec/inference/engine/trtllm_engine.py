@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# TRT-LLM 的 PyTorch 后端用 SaveHiddenStates 捕获训练数据，仓库补丁把结果从文件转存到 Mooncake。
+# 本适配器负责配置和键重建；只支持单节点 TP，最后隐状态是 post-norm，不能套用 vLLM 的 pre-norm 假设。
+
 """
 TensorRT-LLM Ray actor engine for distributed deployment.
 
@@ -73,6 +76,7 @@ _PROTECTED_ENGINE_KEYS = frozenset(
 _TORCHSPEC_MOONCAKE_ENV = "TORCHSPEC_TRTLLM_MOONCAKE"
 
 
+# 将请求 ID 的非字母数字字符替换为下划线，并避免数字开头；算法必须和写入补丁一致才能取回同一对象。
 def _sanitize_mooncake_key(key: str) -> str:
     """Reconstruct the Mooncake key the patch wrote for a request.
 
@@ -85,6 +89,7 @@ def _sanitize_mooncake_key(key: str) -> str:
     return sanitized
 
 
+# 把 TRT-LLM 的捕获模式适配成训练数据生产者，返回元数据而不是经 Ray 搬运大张量。
 class TrtllmEngine(InferenceEngine, RayActor):
     """Ray actor wrapping TensorRT-LLM's PyTorch ``LLM`` in SaveHiddenStates mode.
 
@@ -93,6 +98,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
     streamed to Mooncake by the patched resource manager).
     """
 
+    # 保存放置参数、空模型与捕获状态；实际 GPU 可见性必须在后端导入和 MPI 启动前设置。
     def __init__(
         self,
         args,
@@ -116,6 +122,8 @@ class TrtllmEngine(InferenceEngine, RayActor):
 
         setup_file_logging("inference", self.rank, group=engine_group)
 
+    # 拒绝跨节点和 PP，绑定 GPU，导出存储开关及每引擎键前缀，再创建带隐状态捕获的 LLM。
+    # 不同副本的请求计数可能都从零开始，rank 前缀用于避免它们写入同名对象。
     def init(
         self,
         mooncake_config=None,
@@ -152,6 +160,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
                 f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
             )
 
+        # 存储字段开关必须在 MPI worker 创建前通过环境导出；子进程不会自动看到之后的 Python 属性变化。
         self._store_last_hidden_states = getattr(self.args, "store_last_hidden_states", True)
         # Tell the patched resource manager whether to store last_hidden_states.
         # Set before LLM construction so it propagates to the spawned MPI workers.
@@ -166,6 +175,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
         self._mooncake_config = mooncake_config
         self._setup_mooncake_env(mooncake_config)
 
+        # 先解析 H 与捕获层，既用于配置后端，也用于稍后重建与写入张量一致的元数据。
         self._hidden_size = self._get_hidden_size_from_engine()
         self.aux_hidden_state_layer_ids = self._resolve_aux_layer_ids()
 
@@ -179,6 +189,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
             f"hidden_size={self._hidden_size}"
         )
 
+        # 单节点 TP 启动由 TRT-LLM 负责，工厂传入的跨节点初始化参数在这里明确不使用。
         self._init_engine(tp_size, mem_fraction)
 
         logger.info(
@@ -187,6 +198,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
             f"hidden_size={self._hidden_size})"
         )
 
+    # 在 MPI 子进程启动前导出 Mooncake 配置和重定向标志；有配置时先验证两个服务端口可达。
     def _setup_mooncake_env(self, mooncake_config) -> None:
         """Export Mooncake env + the redirect flag so MPI workers inherit them.
 
@@ -226,6 +238,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
             mooncake_config.metadata_server,
         )
 
+    # 按层执行后的索引筛选合法辅助层，不做 vLLM 的 +1 转换；最后归一化后的状态另用 -1 表示。
     def _resolve_aux_layer_ids(self) -> list[int]:
         """Aux capture layers (post-layer indices, no +1 shift unlike vLLM).
 
@@ -253,6 +266,8 @@ class TrtllmEngine(InferenceEngine, RayActor):
         aux_ids = [lid for lid in aux_ids if 0 <= lid < num_layers]
         return aux_ids
 
+    # 延迟导入 TRT-LLM，设置辅助层加 -1 捕获槽，并关闭前缀复用、分块 prefill 和调度重叠。
+    # 这些约束保证每个请求完整前向且捕获缓冲区在读取前不被下一次执行覆盖。
     def _init_engine(self, tp_size: int, mem_fraction: float | None) -> None:
         """Construct the TRT-LLM PyTorch ``LLM`` in SaveHiddenStates mode."""
         # Imported here (not at module scope) so that importing this module
@@ -264,6 +279,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
         # eagle3_layers_to_capture: aux layers + the final post-norm state (-1).
         # The resource manager orders -1 last in the capture buffer, which is the
         # split point the patch relies on (aux = [:, :-H], last = [:, -H:]).
+        # 辅助层在特征轴前部，-1 的最终 post-norm 表示放最后；补丁据最后 H 列切出 last_hidden_states。
         layers_to_capture = set(self.aux_hidden_state_layer_ids) | {-1}
 
         # output_directory is a required field on the config even though the
@@ -296,6 +312,8 @@ class TrtllmEngine(InferenceEngine, RayActor):
         # hidden states for fewer tokens than the prompt length. The trainer
         # then sees a shape mismatch (engine reports full seq_len, store holds
         # only the recomputed tokens). Disabling reuse forces a full prefill.
+        # 共享前缀缓存只保留 attention 的 K/V，并不自动提供每个 token 的所有辅助层输出。
+        # 例如第二个请求复用了前三个 token，仅重算后两项就无法构成声明长度为 5 的训练样本。
         kv_cache_kwargs: dict[str, Any] = {
             "enable_block_reuse": False,
             "enable_partial_reuse": False,
@@ -304,6 +322,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
             kv_cache_kwargs["free_gpu_memory_fraction"] = mem_fraction
         engine_kwargs["kv_cache_config"] = KvCacheConfig(**kv_cache_kwargs)
 
+        # 长度和 batch 上限控制引擎预留资源；若 extra_args 已指定相关值，setdefault 会保留它。
         max_seq_length = getattr(self.args, "max_seq_length", None)
         if max_seq_length:
             engine_kwargs.setdefault("max_seq_len", max_seq_length)
@@ -318,6 +337,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
         #    process_and_save reads it.
         #  - chunked prefill off: we need each request's full prefill in one
         #    forward so the patch's per-request token offsets stay contiguous.
+        # 捕获区每次前向复用，必须等本次读取完才能让下一次写入；这是生命周期约束而非单纯性能调优。
         engine_kwargs["disable_overlap_scheduler"] = True
         engine_kwargs["enable_chunked_prefill"] = False
 
@@ -334,6 +354,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
             f"layers_to_capture={sorted(layers_to_capture)}"
         )
 
+    # 接受 [S] 或单样本 [1, S] 并返回 [S]；拒绝把真正的多样本矩阵误当一条请求。
     def _normalize_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         if input_ids.dim() == 2 and input_ids.shape[0] == 1:
             return input_ids.squeeze(0)
@@ -341,6 +362,8 @@ class TrtllmEngine(InferenceEngine, RayActor):
             return input_ids
         raise ValueError(f"Unexpected input_ids shape: {input_ids.shape}")
 
+    # 预填充输入后按后端 request_id 和引擎前缀重建写入键；返回 prompt 长度、token 列表及原训练 mask。
+    # max_tokens=1 服务于后端捕获模式，训练张量的长度仍由 prompt 决定，并非 decode completion 样本。
     def generate(
         self,
         data_id: str | list[str],
@@ -366,6 +389,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
         if multimodal_inputs is not None and any(m for m in multimodal_inputs):
             raise NotImplementedError("TrtllmEngine does not support multimodal inputs yet.")
 
+        # 文本路径交后端分词；token 路径先去单样本 batch 维并按后端字典格式包装。
         use_prompts = formatted_prompts is not None
         if use_prompts:
             batch_size = len(formatted_prompts)
@@ -392,6 +416,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
                 f"data_id length {len(data_id)} does not match batch size {batch_size}"
             )
 
+        # mask 属于用户样本而不是 TRT 内部请求编号，因此先按 data_id 建映射供结果组装。
         packed_loss_mask_map: dict[str, str | None] = {}
         if packed_loss_mask_list is not None:
             for i, did in enumerate(data_ids):
@@ -410,6 +435,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
         for i, output in enumerate(outputs):
             did = data_ids[i]
             seq_len = len(output.prompt_token_ids)
+            # 后端 patch 使用内部 request_id 写入；不能改用 data_id 猜存储键，两个编号空间并不相同。
             mooncake_key = _sanitize_mooncake_key(f"{self._key_prefix}{output.request_id}")
 
             result: dict[str, Any] = {
@@ -431,9 +457,11 @@ class TrtllmEngine(InferenceEngine, RayActor):
         )
         return results
 
+    # 以 LLM 对象存在作为轻量就绪信号，未执行实际推理。
     def health_check(self, timeout: float = 5.0) -> bool:
         return self._engine is not None
 
+    # 尝试关闭后端；即使抛异常也清空引用、收集 Python 垃圾并释放未使用的 CUDA 缓存。
     def shutdown(self) -> None:
         if self._engine is not None:
             try:
@@ -447,6 +475,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
                     torch.cuda.empty_cache()
         logger.info(f"TrtllmEngine rank {self.rank}: shutdown complete")
 
+    # 报告位置和模型维度，方便检查启动完成与元数据配置。
     def get_status(self) -> dict:
         return {
             "rank": self.rank,
@@ -455,6 +484,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
             "hidden_size": self._hidden_size,
         }
 
+    # 先读顶层 hidden_size，再读 text_config；两处都没有时明确报错而不猜测维度。
     def _get_hidden_size_from_engine(self) -> int:
         from transformers import AutoConfig
 
@@ -473,6 +503,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
             )
         return hidden_size
 
+    # 对应补丁的按 token 拼接布局：辅助层 [S, K×H]，最后 post-norm 隐状态可选为 [S, H]。
     def _get_tensor_shapes(self, seq_len: int) -> dict:
         """Shapes of the tensors the patch stored to Mooncake (no batch dim).
 
@@ -496,6 +527,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
             shapes["last_hidden_states"] = (seq_len, hidden_size)
         return shapes
 
+    # 对外声明补丁存储的 BF16 隐状态和 long token，并遵循最后隐状态开关。
     def _get_tensor_dtypes(self) -> dict:
         dtypes = {
             "hidden_states": HIDDEN_STATES_STORAGE_DTYPE,

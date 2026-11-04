@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：从目标模型配置推导兼容的草稿几何，尤其保持词表和 RoPE 参数一致。
+# RoPE 用位置旋转 Q/K；相同权重配不同 rope_theta 会得到不同位置频率，不能用通用默认值随意替换。
+
 import copy
 import json
 import logging
@@ -30,12 +33,14 @@ from transformers import AutoConfig, AutoTokenizer
 logger = logging.getLogger(__name__)
 
 
+# 把配置对象转成字典或深拷贝，避免补草稿默认值时反过来修改目标配置。
 def _copy_config_value(value):
     if hasattr(value, "to_dict"):
         return value.to_dict()
     return copy.deepcopy(value)
 
 
+# 复制 RoPE scaling 配置，仅为 YaRN 的缺失/None 字段补兼容默认值，保留明确指定的值。
 def _normalize_rope_scaling(rope_scaling):
     if rope_scaling is None:
         return None
@@ -59,6 +64,8 @@ def _normalize_rope_scaling(rope_scaling):
     return normalized
 
 
+# 同时检查老式顶层 rope_theta 与新版 rope_parameters；两者矛盾时报错，不猜谁正确。
+# 传 default=None 可区分“目标没有声明”和“目标明确要求 10000”，便于多层配置回退。
 def resolve_rope_theta(config, default: Optional[float] = 10000.0) -> Optional[float]:
     """Return the RoPE base a config asks for, wherever it happens to be stored.
 
@@ -92,6 +99,9 @@ def resolve_rope_theta(config, default: Optional[float] = 10000.0) -> Optional[f
     return None if default is None else float(default)
 
 
+# 读取目标 text_config 和 tokenizer，复制几何/位置参数并构建单层 Llama 风格 EAGLE3 配置。
+# 多模态 tokenizer 可能新增特殊 token，因此词表以足够容纳 tokenizer 的大小为准。
+# 这里只生成结构字典，不意味着目标模型所有架构都已转换成草稿，也不加载模型训练权重。
 def generate_draft_model_config(
     target_model_path: str, template_config_path: str = None, cache_dir: str = None
 ):

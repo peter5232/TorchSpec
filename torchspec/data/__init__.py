@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：汇总数据加载、模板、renderer、padding 和 mask 编解码公共接口。
+# 阅读数据语义先看 dataset.py，再顺着所选 parser/renderer 查看 ID 与监督位置的生成。
+
 from torchspec.data.dataset import load_conversation_dataset
 from torchspec.data.preprocessing import (
     preprocess_conversations,

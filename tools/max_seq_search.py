@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# 用真实 teacher embedding/LM head 和随机隐藏状态搜索可训练的最大序列长度。
+# 会加载模型文件、占用 CUDA 并执行真实反向和优化器步；不启动分布式训练或推理服务。
+
 """Find maximum sequence length before OOM for Eagle3 training.
 
 This tool performs binary search to find the maximum sequence length that
@@ -32,6 +35,7 @@ from torchspec.training.optimizer import BF16Optimizer
 from torchspec.utils.memory import available_memory, clear_memory
 
 
+# 构造 [B,S,3H] 辅助状态和 [B,S,H] 目标状态；loss 可覆盖随机约八成位置，或仅尾部指定比例。
 def create_synthetic_batch(
     batch_size: int,
     seq_len: int,
@@ -68,6 +72,7 @@ def create_synthetic_batch(
     }
 
 
+# 显式配置优先，否则从 target 推导 draft 配置；加载并冻结 teacher embedding，再构建 EAGLE3 训练包装。
 def create_eagle3_model(
     target_model_path: str,
     draft_config_path: Optional[str] = None,
@@ -115,9 +120,11 @@ def create_eagle3_model(
         torch_dtype=torch.bfloat16,
     )
 
+    # 仅加载 teacher embedding，teacher 的完整层不在这个模型中；后面的目标特征仍是合成随机值。
     draft_model.load_embedding(target_model_path, embedding_key=embedding_key)
     draft_model.freeze_embedding()
 
+    # 多步展开和 checkpointing 改变激活保存/重算量，会明显影响最大长度，不能当作无关开关。
     eagle3_model = Eagle3Model(
         draft_model=draft_model,
         length=ttt_length,
@@ -129,6 +136,7 @@ def create_eagle3_model(
     return eagle3_model
 
 
+# 使用指定 teacher LM head，否则退到 draft 的头；按词表裁剪状态构造目标并收集多步 loss。
 def run_eagle3_forward(
     model: nn.Module,
     batch: dict,
@@ -167,6 +175,7 @@ def run_eagle3_forward(
     return plosses
 
 
+# 衰减加权各步 loss 并除 accumulation_steps 后执行反向和 step；这里每次调用仍会更新，不实现多次调用后才 step 的累积调度。
 def run_eagle3_backward_and_update(
     plosses: list[torch.Tensor],
     optimizer: BF16Optimizer,
@@ -180,17 +189,20 @@ def run_eagle3_backward_and_update(
     return ploss
 
 
+# 删除合成 batch 的字段引用，为候选长度之间回收中间张量创造条件。
 def cleanup_batch(batch: dict):
     """Delete batch tensors and free memory."""
     for k in list(batch.keys()):
         del batch[k]
 
 
+# 清空优化器动量/方差缓存，下一次实际 step 会重建；FP32 主参数等其他状态仍存在。
 def reset_optimizer_state(optimizer: BF16Optimizer):
     """Reset optimizer state to free memory from momentum/variance buffers."""
     optimizer.optimizer.state.clear()
 
 
+# 在指定长度运行预热和测试步，预热结束后重置峰值统计；OOM 返回失败及简短原因，非 OOM 不当成容量不足。
 def test_seq_len(
     model: nn.Module,
     optimizer: BF16Optimizer,
@@ -213,6 +225,7 @@ def test_seq_len(
     torch.cuda.reset_peak_memory_stats()
 
     try:
+        # 每轮包括目标分布构造、draft 前向、反向和优化器更新，覆盖比推理前向更多的显存对象。
         for i in range(warmup_iters + test_iters):
             batch = create_synthetic_batch(
                 batch_size=batch_size,
@@ -227,6 +240,7 @@ def test_seq_len(
             run_eagle3_backward_and_update(plosses, optimizer)
             cleanup_batch(batch)
 
+            # 预热结束后清缓存并重置峰值，后续统计偏向稳定状态；优化器常驻状态不会因此消失。
             if i == warmup_iters - 1:
                 clear_memory()
                 torch.cuda.reset_peak_memory_stats()
@@ -240,6 +254,7 @@ def test_seq_len(
         reset_optimizer_state(optimizer)
         clear_memory()
         return False, 0.0, f"OOM: {str(e)[:100]}"
+    # 只把错误文本确为 out of memory 的运行异常折成失败，形状/后端错误应立即暴露。
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
             reset_optimizer_state(optimizer)
@@ -248,6 +263,7 @@ def test_seq_len(
         raise
 
 
+# 从低到高按固定网格逐一尝试，首次失败即结束；避免二分先尝试超大张量导致分配器状态干扰后续测试。
 def linear_search_max_seq_len(
     model: nn.Module,
     optimizer: BF16Optimizer,
@@ -271,6 +287,8 @@ def linear_search_max_seq_len(
 
     Returns (max_seq_len, peak_memory_gb).
     """
+    # 下界向下、上界向上对齐，实际尝试可超出用户原始数值范围。
+    # 若 min_seq_len 小于 step_size，lo 可变成零；应读实际 Testing 日志，不把参数原值当作已测试最小值。
     lo = (min_seq_len // step_size) * step_size
     hi = ((max_seq_len + step_size - 1) // step_size) * step_size
     best = lo
@@ -301,6 +319,7 @@ def linear_search_max_seq_len(
             loss_ratio=loss_ratio,
         )
 
+        # 线性法遇首个失败即停，隐含后续更长也不可行的假设；分配器和编译分桶可能使边界不完全平滑。
         if success:
             if verbose:
                 print(f"OK (peak {peak_mem:.2f} GB)")
@@ -315,6 +334,7 @@ def linear_search_max_seq_len(
     return best, best_mem
 
 
+# 把边界按 step 对齐后做二分，成功点作为 best；网格精度和显存碎片都会影响报告的容量边界。
 def binary_search_max_seq_len(
     model: nn.Module,
     optimizer: BF16Optimizer,
@@ -353,6 +373,7 @@ def binary_search_max_seq_len(
         print("-" * 60)
 
     while lo <= hi:
+        # 在 step 网格上选中点，不是每个整数长度都测试；例如 1024 粒度只给出约千 token 精度的边界。
         mid = ((lo + hi) // 2 // step_size) * step_size
 
         if verbose:
@@ -383,9 +404,11 @@ def binary_search_max_seq_len(
                 print(f"FAIL {error}")
             hi = mid - step_size
 
+    # 如果没有成功点，best 仍是初始化的 min_seq_len；应结合 best_mem 和试验记录判断，而不能只看返回正数。
     return best, best_mem
 
 
+# 加载 draft、BF16Optimizer 和 target LM head，再选择线性/二分搜索；最后报告的是当前合成输入和训练配置下的局部容量。
 def main():
     parser = argparse.ArgumentParser(
         description="Find maximum sequence length before OOM for Eagle3 training"
@@ -549,6 +572,7 @@ def main():
     if verbose:
         print("\n[1/4] Loading draft model...")
 
+    # 按真实 target 的维度/embedding 建 draft，其他训练特征随机生成；这不是加载完整 teacher 执行真实数据。
     model = create_eagle3_model(
         target_model_path=args.target_model,
         draft_config_path=args.draft_config,
@@ -591,6 +615,7 @@ def main():
     if verbose:
         print("\n[3/4] Loading target lm_head...")
 
+    # 额外加载 teacher 的完整输出头，容量搜索因此包含目标词表投影权重，而不是只估算 draft 本身。
     target_lm_head = TargetLMHead.from_pretrained(
         model_path=args.target_model,
         lm_head_key=args.lm_head_key,
@@ -608,6 +633,7 @@ def main():
     if verbose:
         print(f"[4/4] {search_method.capitalize()} search for max sequence length...")
 
+    # 当前 --vocab-mapping 只在参数和日志中出现，没有在此加载并设置 t2d/d2t；不要据 CLI 名称假定裁剪映射已生效。
     search_fn = linear_search_max_seq_len if args.linear else binary_search_max_seq_len
     max_seq, peak_mem = search_fn(
         model=model,

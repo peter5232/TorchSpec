@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Eagle3 样本的存储协议：一个逻辑键拆成 _hs、_ids 和可选 _lhs/_tgt，shape/dtype 通过元数据传递。
+# 这里负责精度统一、字节打包、异步发布、读回和删除；控制面拿到键不自动等于远端所有字节都已发布。
+
 import ctypes
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -52,6 +55,7 @@ _DTYPE_ELEMENT_SIZES = {
 HIDDEN_STATES_STORAGE_DTYPE = torch.bfloat16
 
 
+# 在通用 Mooncake 客户端之上定义训练张量字段与后缀，让不同推理后端共享训练侧读取契约。
 class EagleMooncakeStore(MooncakeHiddenStateStore):
     """
     Mooncake Store wrapper specialized for Eagle3 hidden states.
@@ -68,6 +72,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
     TENSOR_SUFFIXES = ["_hs", "_tgt", "_ids", "_lhs"]
 
+    # 为已经规范好 dtype 的任意键/张量组提供批量发布入口；检查数量对应，但不做 put 的 BF16 转换。
     def put_raw_tensors(self, keys: List[str], tensors: List[torch.Tensor]) -> None:
         """Publish an already-normalized group of tensors in one batch.
 
@@ -83,6 +88,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             )
         self._put_raw_tensors(keys, tensors)
 
+    # 有 GPU send buffer 时同步发布，否则轮转主机缓冲并异步复制/写入；CPU 回放无需 CUDA 事件。
+    # 三个生命周期分别受保护：源 GPU 张量由 record_stream 保活、主机缓冲由 Future 保护、远端对象由消费后删除回收。
     def _put_raw_tensors(self, keys: List[str], tensors: List[torch.Tensor]) -> None:
         if self._gpu_direct_available and self._gpu_send_buffer is not None:
             buf = self._gpu_send_buffer
@@ -91,6 +98,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             # current stream. Mooncake does not participate in CUDA stream
             # ordering, so make those writes visible before the NIC reads the
             # registered send buffer.
+            # GPU Direct 省掉 DtoH，但网卡并不了解 CUDA stream 的排队顺序。
+            # 此同步确保设备内 staging 已写完；接下来的同步 put 返回后发送缓冲才能再次覆写。
             torch.cuda.current_stream(buf.device).synchronize()
             self._do_sync_batch_put(keys, buffer_ptrs, sizes)
         elif self._host_buffer_pool is None or self._async_put_manager is None:
@@ -102,17 +111,22 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 "Set async_put_pool_size >= 1 or enable GPU Direct."
             )
         else:
+            # 主机路径借用下一块预注册内存；取到缓冲并不表示它空闲，下一步必须查旧 Future。
             buf = self._host_buffer_pool.get_buffer()
             self._async_put_manager.check_last_error()
             self._async_put_manager.wait_for_buffer(buf.ptr)
 
             # Offline replay tensors are already on the host, so CUDA event and
             # stream synchronization is both unnecessary and unavailable.
+            # 离线回放的源就在 CPU，直接复制到主机缓冲即可提交；此分支不要求 CUDA 可初始化。
             if not any(tensor.is_cuda for tensor in tensors):
                 buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
                 self._async_put_manager.submit(keys, buffer_ptrs, sizes, buf.ptr)
                 return
 
+            # 跨流依赖分成两步：计算流先记事件，复制流等待它，保证读到最终隐状态；
+            # 复制流再记录 copy_done，后台线程等待后才让网卡读取主机缓冲。
+            # 仅使用 non_blocking=True 不能建立这两条先后关系。
             compute_event = torch.cuda.Event()
             compute_event.record()
 
@@ -122,6 +136,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 copy_done = torch.cuda.Event()
                 copy_done.record()
 
+            # 即使 Python 局部 tensor 引用随后离开作用域，record_stream 也让 CUDA 分配器
+            # 在复制流完成使用之前不复用源存储；它负责显存生命周期，不负责通知网卡拷贝完成。
             for t in tensors:
                 if t.is_cuda:
                     t.record_stream(self._copy_stream)
@@ -135,6 +151,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 device_index=self._copy_stream.device.index,
             )
 
+    # 先统一精度，再使用训练相同的 USP 切分逻辑为每个 SP rank 发布带 _uspN 的对象。
+    # dummy loss mask 仅服务切片计算，不是用户真实训练 mask；返回元数据仍描述原始完整样本。
     def put_usp_shards(
         self,
         key: str,
@@ -161,6 +179,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         if target is not None and target.dtype != HIDDEN_STATES_STORAGE_DTYPE:
             target = target.to(HIDDEN_STATES_STORAGE_DTYPE)
 
+        # USP 切分需要与输入位置对齐的目标信息；优先用最后隐状态，没有时才取显式 target。
         target_hs = last_hidden_states if last_hidden_states is not None else target
         if target_hs is None:
             raise ValueError("USP sharded Mooncake storage requires last_hidden_states or target")
@@ -170,8 +189,10 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         else:
             loss_mask_len = input_ids.shape[0]
         dummy_loss_mask = torch.ones((1, loss_mask_len), dtype=torch.long, device=input_ids.device)
+        # SP 总度数拆成 Ulysses 与 ring 两个维度，后续位置切片必须与训练进程的 rank 坐标一致。
         sp_ulysses_size = max(1, sp_size // sp_ring_size)
 
+        # 生产端逐个写出所有训练 SP rank 的分片，减少消费者各自下载完整序列再切开的重复流量。
         for sp_rank in range(sp_size):
             _, ring_rank = get_usp_rank_coords(
                 sp_rank=sp_rank,
@@ -198,6 +219,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 max_len=max_seq_length,
             )
 
+            # rank 写进键空间，把同一逻辑样本的不同序列切片区分开；字段后缀仍沿用 Eagle 协议。
             shard_key = f"{key}_usp{sp_rank}"
             keys = [f"{shard_key}_hs", f"{shard_key}_ids"]
             tensors = [shard_hidden_states, shard_input_ids]
@@ -209,6 +231,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 tensors.append(shard_target_hs)
             self._put_raw_tensors(keys, tensors)
 
+        # 这里返回完整样本形状，而不是最后一次循环的 shard 形状；分片读者还需要 USP 布局元数据。
         shapes = {
             "hidden_states": tuple(hidden_states.shape),
             "input_ids": tuple(input_ids.shape),
@@ -227,6 +250,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         logger.debug("put_usp_shards: completed key=%s, shapes=%s", key, shapes)
         return {"shapes": shapes, "dtypes": dtypes}
 
+    # 把隐状态及可选 target 转 BF16，保留 token 精度，按字段后缀发布并返回转换后的真实 shape/dtype。
+    # 返回意味着已提交发布；需要立即读取的调用方应 flush，不能只凭拿到键判断传输完成。
     def put(
         self,
         key: str,
@@ -252,6 +277,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         self._ensure_initialized()
         logger.debug("put: starting for key=%s", key)
 
+        # 传输格式统一 BF16，避免后端权重精度变化时训练侧仍按固定字节宽度读取。
         if hidden_states.dtype != HIDDEN_STATES_STORAGE_DTYPE:
             hidden_states = hidden_states.to(HIDDEN_STATES_STORAGE_DTYPE)
         if (
@@ -262,6 +288,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         if target is not None and target.dtype != HIDDEN_STATES_STORAGE_DTYPE:
             target = target.to(HIDDEN_STATES_STORAGE_DTYPE)
 
+        # 必需字段先建立键/张量配对；可选 target 与最后隐状态只有非 None 才真实写入。
         keys = [f"{key}_hs", f"{key}_ids"]
         tensors = [hidden_states, input_ids]
 
@@ -275,6 +302,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
         self._put_raw_tensors(keys, tensors)
 
+        # 返回的是精度转换之后的 tensor 描述；不要把调用者转换前的 dtype 重新填回元数据。
         shapes = {
             "hidden_states": tuple(hidden_states.shape),
             "input_ids": tuple(input_ids.shape),
@@ -293,6 +321,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         logger.debug("put: completed key=%s, shapes=%s", key, shapes)
         return {"shapes": shapes, "dtypes": dtypes}
 
+    # 等待所有异步 put 并前后检查缓存异常；因此失败不会在 drain 的日志中被悄悄吞掉。
     def flush(self) -> None:
         """Block until all in-flight async puts have completed.
 
@@ -308,6 +337,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         self._async_put_manager.drain()
         self._async_put_manager.check_last_error()
 
+    # 同步发送指针列表，逐键检查返回码；部分失败时尽力删除整批并附带容量参数报错，避免半个样本看似成功。
     def _do_sync_batch_put(
         self,
         keys: List[str],
@@ -345,11 +375,14 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 "or reducing batch/sequence length/prefetch depth."
             )
 
+    # 按字节连续排放每个张量并记录起点与长度；dtype/shape 不写在缓冲头里，消费者依赖外部元数据解释。
     @staticmethod
     def _stage_tensors_into_buffer(buf, tensors: List[torch.Tensor]) -> Tuple[List[int], List[int]]:
         """Copy tensors into a buffer and return (pointers, sizes) for batch_put_from."""
         buffer_ptrs = []
         sizes = []
+        # 例如 [4, 24] BF16 隐状态占 192 字节，后续 [4] int64 token 从偏移 192 开始占 32 字节。
+        # 发送的是地址和长度；若消费者把 BF16 误写成 FP32，形状一样也会要求两倍字节并读取失败。
         offset = 0
         for tensor in tensors:
             nbytes = buf.copy_from_tensor(tensor, offset=offset)
@@ -358,6 +391,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             offset += nbytes
         return buffer_ptrs, sizes
 
+    # 从元数据组装必需键，先等所有键可见，再尝试 GPU Direct，失败则走主机路径，最终还原 Eagle3TargetOutput。
     def get(
         self,
         key: str,
@@ -380,6 +414,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
         from torchspec.models.target.eagle3_target_model import Eagle3TargetOutput
 
+        # 根据 shapes 决定对象实际包含哪些可选字段，不能假设每种后端都保存了 logits 或最后隐状态。
         keys = [f"{key}_hs", f"{key}_ids"]
         tensor_specs = [
             (
@@ -412,6 +447,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         # previously existed only in the host-buffer fallback.
         self.wait_for_keys(keys)
 
+        # 两条字节传输路径共享同一 keys/specs；GPU Direct 失败可以回退，不改变逻辑张量语义。
         tensor_map = None
         if self._gpu_direct_available and self._gpu_receive_buffer is not None:
             tensor_map = self._get_tensors_gpu_direct(keys, tensor_specs, device)
@@ -423,6 +459,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             logger.debug("Using host buffer path (TCP)")
         logger.debug("Retrieved Eagle3 tensors with base key: %s", key)
 
+        # 恢复模型输出容器只组装引用，不额外 clone；尤其 GPU receive 视图的生命周期继续约束消费者。
         return Eagle3TargetOutput(
             hidden_states=tensor_map["hidden_states"],
             target=tensor_map.get("target"),
@@ -431,6 +468,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             input_ids_cpu=tensor_map.get("input_ids_cpu"),
         )
 
+    # 实际代码把所有字段接收到同一已注册 GPU 缓冲，再返回 dtype/shape 视图；容量不足或传输失败则返回 None。
+    # 注意返回值共享接收缓冲，下一次 get 可覆盖它；应按真实实现理解，不能把上方英文描述理解为每字段独立分配。
     def _get_tensors_gpu_direct(
         self,
         keys: List[str],
@@ -452,6 +491,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             self._compute_tensor_size(shape, dtype) for _, shape, dtype in tensor_specs
         )
 
+        # 总大小按所有字段合计；接收区不够时返回 None 让上层改走主机路径，而不是截断数据。
         if total_size > self._gpu_receive_buffer.size:
             logger.warning(
                 "GPU buffer too small: need %.1fMB, have %.1fMB. Increase gpu_buffer_size in config.",
@@ -466,6 +506,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         offsets: List[int] = []
         offset = 0
 
+        # 把每字段排到同一连续字节区；shape 决定元素数，dtype 决定每元素字节数。
         for _, shape, dtype in tensor_specs:
             size = self._compute_tensor_size(shape, dtype)
             buffer_ptrs.append(self._gpu_receive_buffer.ptr + offset)
@@ -474,6 +515,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             offset += size
 
         try:
+            # 传输完成后检查返回码；负数触发回退，某些客户端以零或实际字节数表示成功。
             results = self._store.batch_get_into(keys, buffer_ptrs, sizes)
             for i, (k, r) in enumerate(zip(keys, results)):
                 if r < 0:
@@ -497,11 +539,14 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 numel *= dim
             buf_slice = self._gpu_receive_buffer.get_slice(offsets[i], sizes[i])
             # View into the registered buffer; valid until the next call.
+            # 这里没有 clone：所有返回字段都借用接收区。下一个请求到来会写同一分配，
+            # 训练侧若需要跨多次 get 持有旧样本，必须在覆盖前把数据转移到独立存储。
             tensor_map[name] = buf_slice.view(dtype)[:numel].reshape(shape)
 
         logger.debug("GPU Direct RDMA transfer successful for %s tensors", len(keys))
         return tensor_map
 
+    # 将所有维度相乘再乘 dtype 字节数；它计算存储长度，不包含 tensor 对象、分配器或对齐开销。
     @staticmethod
     def _compute_tensor_size(shape: Tuple[int, ...], dtype: torch.dtype) -> int:
         """Compute the byte size of a tensor with given shape and dtype."""
@@ -510,6 +555,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             numel *= dim
         return numel * _DTYPE_ELEMENT_SIZES[dtype]
 
+    # 批量取主机缓冲，缺键则按配置重试；逐字段严格核对字节数，再用 frombuffer 解释并搬到目标设备。
+    # input_ids 额外 clone 一份 CPU 副本供训练侧读取，避免为了 token 再从 GPU 同步回来。
     def _get_tensors_via_host_buffer(
         self,
         keys: List[str],
@@ -523,6 +570,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         start_time = time.time()
         last_log = 0.0
 
+        # 即便元数据已经可见，字节获取仍可能暂时缺项，因此此处保留独立的批量 get 重试。
         while True:
             buffers = self._store.batch_get_buffer(keys)
             missing = [i for i, buf in enumerate(buffers) if buf is None]
@@ -530,6 +578,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 break
 
             elapsed = time.time() - start_time
+            # 配置正数上限时超时明确列出缺失对象；非正值不设期限，长期等待需回查生产端发布是否失败。
             if max_wait > 0 and elapsed >= max_wait:
                 missing_keys = ", ".join(keys[i] for i in missing)
                 raise RuntimeError(
@@ -563,6 +612,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             expected_size = numel * element_size
 
             buf_size = buf.size()
+            # 长度不一致常见于捕获 token 数或精度协议错配；拒绝 reshape 错误字节比生成静默错误样本更可靠。
             if buf_size != expected_size:
                 actual_elements = buf_size // element_size if element_size > 0 else 0
                 logger.error(
@@ -575,9 +625,12 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                     f"Size mismatch for {name}: got {buf_size} bytes, expected {expected_size} bytes"
                 )
 
+            # ctypes 和 frombuffer 都不拥有原始网络缓冲；它们只是让 PyTorch 按 dtype 看见同一段内存。
             c_array = (ctypes.c_byte * buf_size).from_address(buf.ptr())
             host_tensor = torch.frombuffer(c_array, dtype=dtype, count=numel).reshape(shape)
 
+            # frombuffer 只借用原生缓冲；目标为 CUDA 时这里的传输产生设备端存储。
+            # 不要把 to(cpu) 想成必然复制：同设备转换可保留共享关系，因此 CPU 调用也要关注原生缓冲生命周期。
             tensor_map[name] = host_tensor.to(device)
 
             if name == "input_ids":
@@ -585,6 +638,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
         return tensor_map
 
+    # 消费后按实际存在的可选字段强制删除，最多尝试三次，仅重试失败键；-704 已不存在也算成功。
+    # 删除是尽力回收，最终失败只记录日志，避免清理失败中断训练读取流程。
     def remove_eagle3_tensors(
         self,
         key: str,

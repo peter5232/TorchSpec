@@ -1,5 +1,7 @@
 # TorchSpec
 
+中文源码阅读：从熟悉的 PyTorch 训练循环入手，理解草稿模型、监督对齐、异步推理与分布式传输，见 [分层阅读教程与全文件导航](docs/reading-guide/zh/README.md)。本注释分支在源码中提供中文函数说明、关键步骤讲解和算例。
+
 TorchSpec is a torch-native speculative decoding training framework. We introduce a disaggregated way of training speculative decoding draft models where inference and training are fully decoupled and stream hidden states directly from inference engine groups to distributed training workers via [Mooncake](https://github.com/kvcache-ai/Mooncake) store, allowing each side to scale independently.
 
 ## Adoption

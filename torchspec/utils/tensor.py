@@ -18,9 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 训练目标对齐的小型张量操作；padding 在这里表示定长位移，并不是扩展序列长度。
+
 import torch
 
 
+# 沿序列维 1 移一位并补零，保持 [B,S,...] 形状；left=False 把 [a,b,c] 变为 [b,c,0]。
+# left=True 则变 [0,a,b]；no_grad 表示这个目标对齐操作不建立反向图。
 @torch.no_grad()
 def padding(tensor, left=True):
     zeropadding = torch.zeros_like(tensor[:, -1:])

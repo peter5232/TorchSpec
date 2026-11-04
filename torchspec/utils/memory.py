@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 内存估算和观测辅助：形状元数据估算传输量，CUDA API 区分设备可用内存与 PyTorch 分配/保留量。
+
 import gc
 from typing import Dict, Tuple
 
@@ -46,6 +48,8 @@ DTYPE_SIZES = {
 }
 
 
+# 逐字段计算各维乘积×dtype 字节数后求和；缺失或未识别 dtype 按 2 字节处理。
+# 它估算张量净载荷，不含 allocator 对齐、通信注册和模型额外开销。
 def estimate_tensor_bytes(tensor_shapes: Dict[str, Tuple[int, ...]], tensor_dtypes: Dict) -> int:
     """Calculate bytes from tensor shapes and dtypes."""
     total = 0
@@ -59,6 +63,7 @@ def estimate_tensor_bytes(tensor_shapes: Dict[str, Tuple[int, ...]], tensor_dtyp
     return total
 
 
+# 等待 CUDA 完成后触发 Python GC 并清 CUDA 缓存；可选清 pinned host 缓存，会引入同步开销。
 def clear_memory(clear_host_memory: bool = False):
     torch.cuda.synchronize()
     gc.collect()
@@ -67,6 +72,7 @@ def clear_memory(clear_host_memory: bool = False):
         torch._C._host_emptyCache()
 
 
+# 查询当前 CUDA 设备总/空闲内存，以及 PyTorch allocated/reserved，返回统一展示字典。
 def available_memory():
     device = torch.cuda.current_device()
     free, total = torch.cuda.mem_get_info(device)
@@ -80,10 +86,12 @@ def available_memory():
     }
 
 
+# 除 1024**3 并保留两位小数，实际使用二进制 GiB 口径，虽展示字段名为 GB。
 def _byte_to_gb(n: int):
     return round(n / (1024**3), 2)
 
 
+# 可先清缓存，再按 rank 记录并返回内存字典；必须各 rank 看，因为分片或不同任务占用可能不同。
 def print_memory(msg, clear_before_print: bool = False):
     if clear_before_print:
         clear_memory()

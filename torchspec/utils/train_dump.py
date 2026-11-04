@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 训练数值诊断工具：保存 CPU 张量快照，比较输入、逐深度损失、梯度和权重，帮助定位两条执行配置的差异。
+# 比较结果仅覆盖共同存在的字段/文件；不能把 match=True 当作所有训练状态完全相同的证明。
+
 """Debug utilities for saving and comparing training data.
 
 Used to verify correctness between train_entry.py and train/train_eagle3.py.
@@ -32,6 +35,7 @@ import torch.nn as nn
 from torchspec.utils.logging import logger
 
 
+# 只提取已有 grad 的参数，detach+clone 后搬 CPU，避免后续 zero_grad/step 改写快照。
 def extract_gradients(model: nn.Module) -> Dict[str, torch.Tensor]:
     """Extract gradients from model parameters.
 
@@ -48,6 +52,7 @@ def extract_gradients(model: nn.Module) -> Dict[str, torch.Tensor]:
     return gradients
 
 
+# 按可选前缀筛参数，detach+clone 并搬 CPU，得到与后续权重更新隔离的调试副本。
 def extract_model_weights(model: nn.Module, filter_prefix: str = None) -> Dict[str, torch.Tensor]:
     """Extract model weights from parameters.
 
@@ -66,6 +71,7 @@ def extract_model_weights(model: nn.Module, filter_prefix: str = None) -> Dict[s
     return weights
 
 
+# 按 1 起点步号判断是否位于前 max_dump_steps；不检查路径或执行 I/O。
 def should_dump_step(step: int, max_dump_steps: int = 5) -> bool:
     """Check if current step should be dumped.
 
@@ -79,6 +85,8 @@ def should_dump_step(step: int, max_dump_steps: int = 5) -> bool:
     return step <= max_dump_steps
 
 
+# 把路径模板中的 step/rank/batch_idx 展开，收集输入与可选损失/梯度/权重并 torch.save。
+# 张量转换为 CPU 以便离线比较，可能触发设备同步，因此只用于少量调试步骤。
 def dump_eagle3_batch(
     args,
     *,
@@ -115,6 +123,8 @@ def dump_eagle3_batch(
         return
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    # 路径模板应包含区分 rank/step/batch 的字段，否则并行写入可能覆盖同一个文件。
+    # 本函数按用户模板落盘，不额外替用户构造唯一文件名。
     path = Path(path_template.format(step=step, rank=rank, batch_idx=batch_idx))
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -125,6 +135,8 @@ def dump_eagle3_batch(
         "batch": {k: v.cpu() if torch.is_tensor(v) else v for k, v in batch.items()},
     }
 
+    # 可选项只在调用者提供时保存；没有某字段与该字段数值为零是不同情况。
+    # detach 防止把计算图带入快照，CPU 化便于跨机器离线比较，但会引入传输等待。
     if plosses is not None:
         data["plosses"] = [pl.detach().cpu() for pl in plosses]
     if acces is not None:
@@ -146,6 +158,8 @@ def dump_eagle3_batch(
     torch.save(data, path)
 
 
+# 读取两份 dump，比较共同输入/损失字段及参数梯度/权重，返回 match、diffs 和键集合摘要。
+# 参数名字缺失会记错，但未同时存在的可选 batch/指标字段会跳过，需结合覆盖范围解释结果。
 def compare_eagle3_outputs(
     path1: str,
     path2: str,
@@ -174,6 +188,8 @@ def compare_eagle3_outputs(
         "summary": {},
     }
 
+    # 先查形状；整数 token/mask 必须完全相等，浮点转 float32 后按 atol/rtol 比较。
+    # 失败记录差异计数或最大/平均绝对误差，verbose 输出每个已检查张量的结果。
     def _compare_tensors(t1, t2, name: str):
         """Compare two tensors and record differences."""
         if t1.shape != t2.shape:
@@ -201,6 +217,8 @@ def compare_eagle3_outputs(
             print(f"  {status} {name}: shape={tuple(t1.shape)}, dtype={t1.dtype}")
 
     # Compare batch inputs
+    # 建议先核对输入再解释梯度差异：mask/位置错一位会让整条监督链都不一致。
+    # 此循环只检查两边共同有的输入字段，因此阅读报告时还要人工确认两边 dump 的采集配置一致。
     for key in ["input_ids", "attention_mask", "loss_mask", "target", "hidden_states"]:
         if key not in data1.get("batch", {}) or key not in data2.get("batch", {}):
             continue
@@ -225,6 +243,8 @@ def compare_eagle3_outputs(
         _compare_tensors(data1["total_loss"], data2["total_loss"], "total_loss")
 
     # Compare gradients
+    # 同名梯度逐项比较；仅一边有的参数名会使整体 match=False，并最多展示 10 个名字。
+    # 这有助于发现冻结策略变化，但某参数没有 grad 也可能是本 batch 未经过该分支。
     if "gradients" in data1 and "gradients" in data2:
         grads1, grads2 = data1["gradients"], data2["gradients"]
         common_keys = set(grads1.keys()) & set(grads2.keys())
@@ -248,6 +268,8 @@ def compare_eagle3_outputs(
             _compare_tensors(grads1[key], grads2[key], f"gradients/{key}")
 
     # Compare model weights
+    # 权重快照需要在相同训练边界采集，例如都在 optimizer.step 之前。
+    # 若一个在更新前、另一个在更新后，即使算法相同，也不能期待逐参数比较相等。
     if "model_weights" in data1 and "model_weights" in data2:
         weights1, weights2 = data1["model_weights"], data2["model_weights"]
         common_keys = set(weights1.keys()) & set(weights2.keys())
@@ -273,6 +295,8 @@ def compare_eagle3_outputs(
     return results
 
 
+# 按同名文件求交集并逐对比较，另列目录独有文件；独有文件本身不会把 match 设为 False。
+# 因此 files_compared=0 的成功不代表完成了有效数值验证。
 def compare_eagle3_batches(
     dir1: str,
     dir2: str,
@@ -298,6 +322,8 @@ def compare_eagle3_batches(
     files1 = {f.name: f for f in dir1.glob(pattern)}
     files2 = {f.name: f for f in dir2.glob(pattern)}
 
+    # 以文件名而非文件顺序匹配，所以 dump 模板应把 step/rank/batch 编进名字。
+    # 仅存在于一个目录的文件被列入摘要，但当前函数不把这种缺失自动计为数值不匹配。
     common_files = set(files1.keys()) & set(files2.keys())
 
     overall_results = {
@@ -308,6 +334,8 @@ def compare_eagle3_batches(
         "per_file_results": {},
     }
 
+    # 逐文件调用单对比较并折叠 match；没有共同文件时循环为空，默认 True 保持不变。
+    # 因此验证报告必须同时看 files_compared 和独有文件列表，不能只读取一个布尔值。
     for filename in sorted(common_files):
         if verbose:
             print(f"\nComparing {filename}...")
@@ -334,6 +362,7 @@ def compare_eagle3_batches(
     return overall_results
 
 
+# 输出 dump 的步号、张量 shape/dtype、loss/accuracy；梯度和权重最多列前 20 项范数。
 def load_and_print_eagle3_dump(path: str, show_gradients: bool = False):
     """Load and print summary of an Eagle3 training dump.
 
@@ -348,6 +377,8 @@ def load_and_print_eagle3_dump(path: str, show_gradients: bool = False):
     print(f"Batch IDX: {data.get('batch_idx', 'N/A')}")
     print(f"Rank: {data.get('rank', 'N/A')}")
 
+    # 先展示输入形状/dtype，再看标量损失和逐深度统计，帮助确认 dump 来自期望配置。
+    # 这里只打印摘要，不会重新前向计算，也不证明保存的数值和模型状态彼此一致。
     if "batch" in data:
         print("\nBatch tensors:")
         for key, tensor in data["batch"].items():
@@ -367,6 +398,8 @@ def load_and_print_eagle3_dump(path: str, show_gradients: bool = False):
         for i, ac in enumerate(data["acces"]):
             print(f"  pos_{i}: {ac.item():.4f}")
 
+    # 梯度最多显示按名字排序的前 20 个条目，输出范数便于定位大尺度异常。
+    # 没有显示的参数仍可能存在于文件；要验证全部参数应调用 compare_eagle3_outputs。
     if show_gradients and "gradients" in data:
         print(f"\nGradients ({len(data['gradients'])} parameters):")
         for name, grad in sorted(data["gradients"].items())[:20]:
@@ -384,6 +417,8 @@ def load_and_print_eagle3_dump(path: str, show_gradients: bool = False):
             print(f"  ... and {len(data['model_weights']) - 20} more parameters")
 
 
+# 只打印分别生成两组 dump 及比较的命令示例，并返回目录路径，不实际启动训练任务。
+# 示例中包含旧版入口名，使用时应核对当前仓库入口和配置格式。
 def run_comparison_test(
     config1_path: str,
     config2_path: str,
@@ -404,6 +439,8 @@ def run_comparison_test(
     Returns:
         Dict with paths to run for comparison.
     """
+    # 这只是教学/诊断命令生成器：不会执行配置、创建模型、提交 Ray 任务或采集数据。
+    # 需要用户在真正训练环境分别生成快照，再运行比较；num_steps 这里只插入打印的命令文本。
     dir1 = Path(output_dir) / "config1"
     dir2 = Path(output_dir) / "config2"
 

@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：导出配置 schema、加载器与扁平化转换；实际派生逻辑在 train_config.py。
+
 from torchspec.config.train_config import Config, config_to_flat_args, load_config
 
 __all__ = [

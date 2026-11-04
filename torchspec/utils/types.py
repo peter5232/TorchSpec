@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 跨编排/推理边界的数据协议：InferenceInput 携带 prompt/token/mask，InferenceOutput 携带 Mooncake key 与形状。
+# 输出不是大张量本体；消费者按 key 获取实际数据，metadata 的 default_factory 避免不同样本共用字典。
+
 from dataclasses import dataclass, field
 
 import torch
@@ -45,6 +48,7 @@ class InferenceOutput:
     """Output from inference, contains mooncake key and tensor metadata."""
 
     data_id: str
+    # 传输句柄与 shapes/dtypes 必须一起解释：key 不自带 PyTorch 的 tensor 布局信息。
     mooncake_key: str
     tensor_shapes: dict[str, tuple[int, ...]]
     tensor_dtypes: dict[str, torch.dtype] | None = None

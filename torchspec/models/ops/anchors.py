@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 固定预算锚点采样器，供 EAGLE3 anchored 与 DFlash 共用。
+# 采样发生在监督位置序列上，固定槽数稳定编译形状，keep_mask 负责标出占位槽。
 """Anchor sampling shared by the anchored draft training paths."""
 
 from typing import Optional, Tuple
@@ -27,6 +29,8 @@ import torch
 from torchspec.utils.logging import logger
 
 
+# 仅保留自身和下一位置都监督的锚点，尾界同时考虑 block_size 与至少一个后继 token。
+# 返回候选总数、布尔有效性、每样本有效数和以 S+1 替代无效位置的索引，便于排序。
 def _candidates(seq_len: int, loss_mask: torch.Tensor, block_size: int, device: torch.device):
     """Positions usable as anchors, as (num_candidates, valid, valid_counts, masked_indices).
 
@@ -43,6 +47,7 @@ def _candidates(seq_len: int, loss_mask: torch.Tensor, block_size: int, device: 
     return num_candidates, valid, valid.sum(dim=1), torch.where(valid, indices, seq_len + 1)
 
 
+# 序列太短时返回 [B,N] 全零锚点和全 False mask；仍保留固定形状，后续损失自然为零。
 def _empty(bsz: int, num_anchors: int, seq_len: int, block_size: int, device: torch.device):
     logger.warning(
         f"Sequence too short for anchor sampling (seq_len={seq_len}, "
@@ -54,6 +59,9 @@ def _empty(bsz: int, num_anchors: int, seq_len: int, block_size: int, device: to
     )
 
 
+# 把有效位置排序，用随机相位与受 max_gap 限制的步长在有效位置环上抽样。
+# 不足 N 个有效位置时只保留前 valid_count 槽；相位覆盖全环以避免只偏爱序列中间。
+# 返回槽顺序可能因取模回绕，并非总是数值递增；gap 数的是监督位置，不是原始 token 距离。
 def sample_anchor_positions(
     seq_len: int,
     loss_mask: torch.Tensor,
@@ -105,6 +113,7 @@ def sample_anchor_positions(
         seq_len, loss_mask, block_size, device
     )
     # Supervised positions in order; sentinels sort to the back and are masked off below.
+    # 无效候选替换成 S+1，所以排序后自动靠末尾；后续 rank 只在有效计数范围内取值。
     ordered = masked_indices.sort(dim=1).values
 
     # Spread the budget over the whole sample when it reaches, otherwise pack as tightly
@@ -113,12 +122,15 @@ def sample_anchor_positions(
     # sampling would. Drawing the phase over the leftover slack instead would pick the
     # middle of a sample far more often than its ends.
     counts = valid_counts.unsqueeze(1).clamp(min=1)
+    # 预算足够时步长为1；预算较小时尽量铺开，但不能超过 max_gap+1，从而控制每个 token 的深度覆盖。
     stride = (valid_counts // num_anchors).clamp(min=1, max=max_gap + 1).unsqueeze(1)
+    # 随机相位从整个有效环取值，保证序列首尾候选都可被抽中，避免只在中间小窗口采样的偏置。
     offset = (torch.rand(bsz, 1, device=device) * counts).long()
 
     slot = torch.arange(num_anchors, device=device).unsqueeze(0)
     # num_anchors * stride <= valid_count by construction, so the wrap never collides.
     rank = (offset + slot * stride) % counts
+    # 有效数<N 时 rank 会取模重复，但这些重复槽被 keep_mask 禁用；固定形状与真实监督数量由两张张量分工。
     keep_mask = slot < valid_counts.unsqueeze(1)
     anchors = ordered.gather(1, rank.clamp(max=num_candidates - 1))
     return torch.where(keep_mask, anchors, 0), keep_mask

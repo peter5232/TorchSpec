@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 用临时 forward hook 验证教师最后一层与 final norm 的精确边界，避免把 pre/post-norm 状态混用。
+# 返回 detach 的二者；每次调用都检查真实张量关系，而不是依赖模型输出字段的名字。
 """Capture a Hugging Face decoder's hidden states on both sides of its final norm.
 
 Which side of the final norm a hidden state comes from is easy to get wrong:
@@ -43,6 +45,8 @@ class FinalNormBoundary:
     post_norm: torch.Tensor
 
 
+# 注册 norm 和最后 block 的 hook，执行一次 no_grad forward，并在 finally 中移除所有 hook。
+# 逐项验证 norm 输入等于末层输出、重算 norm 一致、返回状态是 post-norm；恒等 norm 无法观测边界则报错。
 @torch.no_grad()
 def capture_final_norm_boundary(decoder: nn.Module, **forward_kwargs) -> FinalNormBoundary:
     """Run ``decoder`` and return the input and output of ``decoder.norm``.
@@ -56,17 +60,21 @@ def capture_final_norm_boundary(decoder: nn.Module, **forward_kwargs) -> FinalNo
 
     captured: dict[str, torch.Tensor] = {}
 
+    # 同时捕获 norm 的输入与输出引用，确保比较的是同一次 forward 的两侧张量。
     def norm_hook(module, args, output):
         captured["pre_norm"] = args[0]
         captured["post_norm"] = output
 
+    # 兼容 block 返回 tuple 或 Tensor，取其隐藏态与 final norm 输入逐位比较。
     def block_hook(module, args, output):
         captured["block"] = output[0] if isinstance(output, tuple) else output
 
+    # 临时 hook 只覆盖本次 forward，捕获真实调用链；不会修改模块 forward 或参数。
     handles = [
         decoder.norm.register_forward_hook(norm_hook),
         decoder.layers[-1].register_forward_hook(block_hook),
     ]
+    # 即使 decoder forward 抛异常也要 remove hook，否则以后重复运行会不断积累捕获副作用。
     try:
         output = decoder(**forward_kwargs)
     finally:
@@ -79,6 +87,7 @@ def capture_final_norm_boundary(decoder: nn.Module, **forward_kwargs) -> FinalNo
         raise RuntimeError("final-norm input is not the last decoder block's output")
     if not torch.equal(decoder.norm(pre_norm), post_norm):
         raise RuntimeError("re-applying the final norm does not reproduce its captured output")
+    # 若两侧完全相等，无法证明抓到了可区分边界，主动拒绝给调用方一个看似可靠的判定。
     if torch.equal(pre_norm, post_norm):
         raise RuntimeError("final norm is an identity on this input; boundary is not observable")
     if not torch.equal(output.last_hidden_state, post_norm):

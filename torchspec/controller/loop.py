@@ -18,6 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：主循环把异步样本生产与同步 optimizer step 连接起来。
+# 熟悉 PyTorch 的读者可把 train_from_queue 看成远程执行的“取若干 micro-batch、backward、step”。
+# 一个 dispatch 只是各 DP rank 的一次供料，accumulation_steps 次供料才形成一次 optimizer step。
+# 评估、保存、权重同步都在这个边界安排，防止把尚未完成的梯度累积误认为一个已完成训练步。
+
 """Pipeline training loop: main training loop with sync training and async inference."""
 
 import re
@@ -39,6 +44,7 @@ from torchspec.controller.eval import (
 from torchspec.utils.logging import get_tb_writer, logger
 
 
+# 输出训练日志并发送到已启用的跟踪后端；推理与训练指标可以使用不同横轴步数。
 def _write_training_metrics(metrics: dict, train_step: int, inference_step: int) -> None:
     loss = metrics.get("train/avg_loss")
     if isinstance(loss, (int, float)):
@@ -55,6 +61,9 @@ def _write_training_metrics(metrics: dict, train_step: int, inference_step: int)
                 tb_writer.add_scalar(key, value, scalar_step)
 
 
+# 仅在 decode 训练且到同步间隔时导出草稿并通知各引擎从磁盘加载。
+# 训练进程与推理进程不共享 nn.Module，训练端更新参数不会自动更新服务端副本。
+# 当前实现使用本地临时目录，多节点可见性受文件系统部署约束；finally 保证清理临时目录。
 def _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engines):
     """Sync draft model weights to inference engines (decode mode only)."""
     weight_sync_enabled = getattr(args, "decode_weight_sync_enabled", False)
@@ -89,10 +98,13 @@ def _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engi
         logger.info(f"Cleaned up temp dir {tmp_dir}")
 
 
+# interval>0 才启用周期保存，再检查整除；零或负数明确关闭这项调度。
 def _is_save_interval_step(step: int, interval: int) -> bool:
     return interval > 0 and step % interval == 0
 
 
+# 只按 iter_数字 目录的步数排序删除较早项，保留非该命名的元数据文件。
+# 保留 best_* 指示文件不等于保证它指向的旧 iter 目录也保留，读者需区分指针和实际权重。
 def _cleanup_old_checkpoints(checkpoint_dir: str | None, max_checkpoints: int) -> None:
     """Delete old checkpoints, keeping only the most recent `max_checkpoints`.
 
@@ -125,6 +137,8 @@ def _cleanup_old_checkpoints(checkpoint_dir: str | None, max_checkpoints: int) -
             logger.warning(f"Failed to remove old checkpoint {old_dir}: {e}")
 
 
+# 先停推理管理器并等待它退出，再关闭引擎和 Mooncake master；各阶段异常仅记日志。
+# 这样清理失败不会遮住原来的训练异常，且尽量避免存储先退出而引擎仍在写入。
 def _safe_training_cleanup(
     args, inference_manager, inference_future, inference_engines=None
 ) -> None:
@@ -164,6 +178,10 @@ def _safe_training_cleanup(
             logger.warning(f"Failed to shutdown mooncake master actor: {exc}")
 
 
+# 先构建/加载固定评估特征，再提交训练数据，随后按 optimizer 步数运行。
+# 外层计步，内层尝试凑齐并预取 dispatch；当前一步已备齐时即开算，不必等所有预取槽填满。
+# 每次同时向全部训练 actor 发请求后 ray.get 等待：DP rank 必须共同参与梯度通信。
+# 恢复位置按已完成步数推算，异步队列尾部不能保证逐样本精确恢复。
 def training_loop(
     args,
     controller,
@@ -243,6 +261,8 @@ def training_loop(
     )
 
     enable_perf = getattr(args, "enable_perf_metrics", True)
+    # 即便配置不额外预取，也至少凑齐一次 optimizer step 所需的累积批次。
+    # 例如累积=3、prefetch_depth=1，实际至少备 3 个 dispatch，才能让所有 rank 完成本次更新。
     prefetch_batches = max(accumulation_steps, getattr(args, "prefetch_depth", 0))
 
     completed_steps = start_step
@@ -257,6 +277,8 @@ def training_loop(
     previous_dispatch_wait: float | None = None
     progress = tqdm(total=num_steps, desc="Training", unit="step", initial=start_step)
     while completed_steps < num_steps:
+        # 限制预取不跨本轮 epoch/总训练步数边界，避免结束后多余样本长期留在队列。
+        # 计数单位在这里仍是 optimizer step，下一行乘 accumulation_steps 才得到 dispatch 数。
         remaining_steps = min(
             num_steps - completed_steps,
             steps_per_epoch - steps_in_current_epoch,
@@ -277,6 +299,8 @@ def training_loop(
                 consecutive_failures = 0
             else:
                 consecutive_failures += 1
+                # 已经有完整一步的数据时，停止追求额外预取并立即开算。
+                # 否则为了填满预取窗口而继续等待，会让本来能训练的 GPU 空闲，削弱流水线重叠收益。
                 if queued_batches >= accumulation_steps:
                     # The current step can run while inference refills the pool.
                     target_queued_batches = queued_batches
@@ -343,12 +367,16 @@ def training_loop(
                 for actor in train_group._actor_handlers
             ]
 
+            # 每个 actor 内部做前向/反向和同步通信；driver 在这里等待整组完成。
+            # 先向所有 rank 提交再统一等待，不能在创建列表时逐个等待，否则首个 rank 可能卡在 collective。
             train_results = ray.get(train_futures)
             queued_batches -= accumulation_steps
             completed_steps += 1
 
             # Log metrics from training (use rank 0's metrics - they're already all-reduced)
             metrics = train_results[0] if train_results and train_results[0] else {}
+            # 训练侧为减少 CUDA 同步可能延后一轮才取回指标，因此日志所属 step 可能不是刚完成的 step。
+            # 调度等待时间也要对齐这份指标，避免把前一步 compute 和后一步 wait 拼成虚假的性能分解。
             metric_step = int(metrics.pop("_metrics_step", completed_steps))
             metric_dispatch_wait = (
                 previous_dispatch_wait
@@ -504,6 +532,7 @@ def training_loop(
     )
 
 
+# 启动后台推理后进入同步训练循环；try/finally 确保正常退出和异常退出都执行资源清理。
 def run_training_loop(
     args,
     controller,

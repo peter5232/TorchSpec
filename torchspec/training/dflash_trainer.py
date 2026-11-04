@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# DFlash 系列共用训练器：构造 block/anchor 目标，支持 DFlash2 与 DSpark 通过 hook 更换网络。
+# 其梯度按整个累积窗口的有效监督分母归一化，不能直接套用逐 batch 平均 loss 的直觉。
+
 """DFlash trainer — extends Trainer with DFlash-specific model init, forward, and metrics."""
 
 from argparse import Namespace
@@ -52,10 +55,12 @@ class DFlashTrainer(Trainer):
     _anchor_slot_offset = 1
     _extra_loss_component_keys: list[str] = []
 
+    # 按配置构造基础 DFlash draft；子类覆盖此 hook 时仍复用公共初始化及优化器流程。
     def _build_draft_model(self, config):
         """Instantiate the draft network. Overridden by subclasses."""
         return DFlashDraftModel(config)
 
+    # 把 draft 与 anchor 数、block 大小、目标类型和损失权重封装成 DFlashModel。
     def _build_training_wrapper(self, draft_model):
         """Wrap the draft network with the training-objective module."""
         return DFlashModel(
@@ -69,6 +74,7 @@ class DFlashTrainer(Trainer):
             l1_loss_alpha=self.l1_loss_alpha,
         )
 
+    # 记录目标层数、anchor/block 参数和损失配置，并初始化冻结 teacher head/norm 的可选状态。
     def __init__(self, args: Namespace):
         super().__init__(args)
         self.target_lm_head: Optional[torch.nn.Module] = None
@@ -83,6 +89,9 @@ class DFlashTrainer(Trainer):
         self._last_hs_prenorm = getattr(args, "last_hidden_states_prenorm", False)
         self.verifier_norm: Optional[torch.nn.Module] = None
 
+    # 接受路径、字典或配置对象，补齐 teacher 层数等信息后构造 draft。
+    # rank 0 加载初始权重及 teacher embedding，冻结 embedding，再按 dp_mesh 包装和广播。
+    # 建立优化器/调度器并恢复状态，最后加载目标 head；可选 torch.compile 后取原始 wrapper 访问模型字段。
     def init_model(
         self,
         draft_model_config,
@@ -103,6 +112,8 @@ class DFlashTrainer(Trainer):
         with init_context():
             cfg_cls = self._draft_config_class
 
+            # 路径、dict 和已解析配置对象最终统一为同一 config，后续构建 hook 不需重复处理三种输入。
+            # config 的目标层数、hidden size 与实际 teacher 输出形状必须一致，否则最后维拆分会错位。
             if isinstance(draft_model_config, str):
                 config = cfg_cls.from_pretrained(draft_model_config)
             elif isinstance(draft_model_config, dict):
@@ -142,6 +153,8 @@ class DFlashTrainer(Trainer):
                 embedding_key=getattr(self.args, "embedding_key", "model.embed_tokens.weight"),
             )
 
+        # embedding 由 teacher 提供并冻结；draft 主体转 BF16 以降低前向与激活开销。
+        # 优化器后面另外建立 FP32 master，模型 dtype 并不说明 Adam 的更新也以 BF16 累计。
         draft_model.freeze_embedding()
         draft_model = draft_model.to(torch.bfloat16)
 
@@ -173,6 +186,8 @@ class DFlashTrainer(Trainer):
             cpu_offload=True if self.fsdp_cpu_offload else None,
         )
 
+        # compile 在 FSDP 包装和权重广播之后，模型属性访问则解开 _orig_mod/module。
+        # 训练调用仍走 compiled wrapper，访问 self.dflash 只是取得目标配置及 draft 引用。
         if getattr(self.args, "compile_model", False):
             logger.info("Compiling DFlash model with torch.compile (inductor backend)")
             dflash_model = torch.compile(dflash_model)
@@ -198,6 +213,8 @@ class DFlashTrainer(Trainer):
             min_lr=getattr(self.args, "min_lr", 0.0),
         )
 
+        # 普通优化器构造先使用兼容曲线，WSD 分支再替换 scheduler。
+        # self.lr_scheduler 在此分支后读取，确保 checkpoint 保存的是实际在用的调度器。
         if decay_style == "WSD" and total_steps:
             from torchspec.training.lr_scheduler import LRSchedulerWithWarmup
 
@@ -218,6 +235,8 @@ class DFlashTrainer(Trainer):
         checkpoint_payload = checkpoint.load(self)
         checkpoint.finalize_load(self, checkpoint_payload)
 
+        # teacher head 独立于可训练 draft，用于把 teacher/预测特征映射到监督空间。
+        # 它的权重被冻结，不应出现在 draft optimizer 的参数列表中。
         self._init_target_lm_head(target_model_path)
 
         if self.target_lm_head is None:
@@ -236,6 +255,8 @@ class DFlashTrainer(Trainer):
     # Target LM head (same as Eagle3Trainer)
     # ------------------------------------------------------------------
 
+    # teacher head 总是加载；norm 仅在输入是 pre-norm 且当前目标实际使用末层特征时加载。
+    # 这与 _forward 的条件一致，防止既没加载 norm 却使用未归一化特征。
     def _init_target_lm_head(self, target_model_path: str) -> None:
         from torchspec.models.target.target_utils import load_synced_target_lm_head
 
@@ -262,6 +283,7 @@ class DFlashTrainer(Trainer):
     # Forward / backward
     # ------------------------------------------------------------------
 
+    # 沿最后维拆 [B,S,L*H] 为 L 个 [B,S,H] 层特征；顺序必须与生产端拼接层顺序一致。
     def _split_hidden_states(self, hidden_states: torch.Tensor) -> List[torch.Tensor]:
         """Split concatenated hidden states [B, seq_len, num_layers*D] into per-layer list.
 
@@ -272,6 +294,8 @@ class DFlashTrainer(Trainer):
         per_layer_dim = total_dim // self.num_target_layers
         return list(hidden_states.split(per_layer_dim, dim=-1))
 
+    # 将 token、mask、辅助特征搬到 CUDA，并按目标需要读取/归一化末层 teacher 特征。
+    # 网络返回标量、逐位置统计、附加损失项及原始 (分子,分母)，后者用于全窗口梯度归一化。
     def _forward(
         self, batch: dict
     ) -> Tuple[
@@ -295,6 +319,8 @@ class DFlashTrainer(Trainer):
         # Gated on the same predicate as the norm load: feeding the loss an
         # unnormalised pre-norm tensor is silently wrong, so a run that skipped
         # the norm must not consume these at all.
+        # 有些目标只需要硬 token/其他特征，不读取 teacher 末层 hidden state。
+        # 初始化是否加载 verifier norm 与这里是否消费末层特征使用同一 predicate，避免 silent 数值偏移。
         last_hidden_states = None
         if self.dflash.uses_target_hidden_states and batch.get("last_hidden_states") is not None:
             last_hidden_states = batch["last_hidden_states"].to(device, non_blocking=True)
@@ -302,6 +328,8 @@ class DFlashTrainer(Trainer):
                 with torch.no_grad():
                     last_hidden_states = self.verifier_norm(last_hidden_states)
 
+        # 例如 B=2,S=128,L=5,H=4096，输入末维为 20480，拆成 5 个 [2,128,4096]。
+        # split 结果通常仍是共享存储的视图；删除原变量名不会释放这些视图还需要的存储。
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states
 
@@ -321,6 +349,8 @@ class DFlashTrainer(Trainer):
             last_hidden_states=last_hidden_states,
         )
 
+        # loss/accuracy 用来展示，loss_terms 才是训练窗口归一化的原料。
+        # 调用者不能只取 loss.backward() 替代原始分子累积，否则不同 mask 数量的 batch 权重会改变。
         return (
             loss,
             accuracy,
@@ -331,11 +361,15 @@ class DFlashTrainer(Trainer):
             loss_terms,
         )
 
+    # 把传入标量除 accumulation_steps 后 backward，返回未缩放标量；训练调用方传的是损失分子。
     def _backward(self, loss: torch.Tensor, accumulation_steps: int = 1) -> torch.Tensor:
         scaled_loss = loss / accumulation_steps
         scaled_loss.backward()
         return loss
 
+    # 跨 dp_group 求有效分母总和 D；当前梯度已除累积次数 K 并经 FSDP 平均 R 次，故再乘 R*K/D。
+    # 例如 R=2、K=4、D=80，当前分子梯度和/8 再乘 0.1，最终成为分子梯度和/80。
+    # D=0 时用设备侧 where 将梯度置零，避免每步 .item() 同步和各 rank 分支分歧。
     def _normalize_accumulated_gradients(
         self,
         local_denominator: torch.Tensor,
@@ -361,6 +395,7 @@ class DFlashTrainer(Trainer):
             if world_size > 1:
                 dist.all_reduce(denominator, op=dist.ReduceOp.SUM, group=group)
 
+        # 归约后的梯度是 SUM(grad numerator)/(R*K)，以下系数把它变成 SUM(grad numerator)/D。
         scale = torch.where(
             denominator > 0,
             (world_size * accumulation_steps) / denominator.clamp(min=1e-6),
@@ -376,6 +411,7 @@ class DFlashTrainer(Trainer):
     # Eval (no-grad forward on CPU-cached data) — mirrors Eagle3Trainer
     # ------------------------------------------------------------------
 
+    # 仅做 no_grad 前向，把逐位置损失/准确率/计数及附加分子分母交给评估汇总。
     def eval_forward(self, batch: dict) -> dict:
         """Single forward pass without backward — returns per-position tensors."""
         with torch.no_grad():
@@ -395,6 +431,8 @@ class DFlashTrainer(Trainer):
             **loss_components,
         }
 
+    # 先把逐位置均值乘 count 恢复分子，跨 microbatch 和默认进程组 SUM，再除总 count。
+    # 空位置用 count.clamp(min=1) 得到零值，返回计数供后续跨位置加权。
     def _reduce_position_metrics(
         self,
         all_step_metrics: list[dict],
@@ -418,6 +456,8 @@ class DFlashTrainer(Trainer):
         avg_acc_pp = correct_sum_pp / safe_count_pp
         return avg_loss_pp, avg_acc_pp, count_pp
 
+    # accuracy 按所有预测位置 token 数加权；loss 额外按 exp(-k/gamma) 衰减位置。
+    # 这是日志标量的计算规则，不应据此推断所有目标函数都优化同一标量。
     def _compute_scalar_metrics(
         self,
         pred_loss_pp: torch.Tensor,
@@ -439,6 +479,8 @@ class DFlashTrainer(Trainer):
         avg_loss = ((pred_loss_pp * weighted_counts).sum() / safe_weighted_count).item()
         return avg_loss, avg_acc
 
+    # 对各附加损失的 (numerator,denominator) 一起打包归约，仅最后相除并同步到 CPU。
+    # 若先平均各 microbatch 的均值，会把监督稀疏的小 batch 赋予过大权重。
     def _reduce_loss_components(self, all_step_metrics: list[dict], prefix: str) -> dict:
         """Reduce extra loss components into ``{prefix}{key}`` token-pooled means.
 
@@ -453,6 +495,8 @@ class DFlashTrainer(Trainer):
         """
         keys: list[str] = []
         totals: list[torch.Tensor] = []
+        # 附加项由具体模型类声明，例如 selector_loss 或 ce/l1/confidence_loss。
+        # 每项的 denominator 可能对应不同监督区域，因此需要逐项保留自己的分母，不能套用主 loss 的 count。
         for key in self._extra_loss_component_keys:
             pairs = [m[key] for m in all_step_metrics if key in m]
             if not pairs:
@@ -474,12 +518,15 @@ class DFlashTrainer(Trainer):
         if not keys:
             return {}
 
+        # 形状为 [组件数,2]；列 0 是分子，列 1 是分母。
+        # 归约之后一次 tolist 同步，比为每个组件做两次 .item() 更少阻塞 CPU 发起后续任务。
         packed = torch.stack(totals)
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(packed, op=dist.ReduceOp.SUM)
         pooled = (packed[:, 0] / packed[:, 1].clamp(min=1e-6)).tolist()
         return {f"{prefix}{key}": value for key, value in zip(keys, pooled, strict=True)}
 
+    # 按 eval_micro_batch_size 重组 CPU 样本，切 eval/no_grad 计算，再恢复 train 并汇总。
     def eval_from_cache(self) -> dict:
         """Run forward-only eval over all CPU-cached eval samples.
 
@@ -506,6 +553,7 @@ class DFlashTrainer(Trainer):
 
         return self._aggregate_eval_metrics(all_metrics)
 
+    # 按 count 池化逐位置指标，去掉模型约定的 anchor 槽，再生成 loss、accuracy 与接受长度近似。
     def _aggregate_eval_metrics(self, all_step_metrics: list[dict]) -> dict:
         if not all_step_metrics:
             return {}
@@ -518,6 +566,8 @@ class DFlashTrainer(Trainer):
         )
 
         # Drop anchor slot (index 0) — see _aggregate_metrics for rationale.
+        # 先跨 batch/rank 池化，再按模型约定去掉非预测槽。
+        # 不能先把所有位置均值平均成一个标量，否则短序列尾部稀疏的位置会获得不合理权重。
         pred_loss_pp = avg_loss_pp[self._anchor_slot_offset :]
         pred_acc_pp = avg_acc_pp[self._anchor_slot_offset :]
         pred_count_pp = count_pp[self._anchor_slot_offset :]
@@ -541,6 +591,8 @@ class DFlashTrainer(Trainer):
             metrics[f"eval/ploss_{i}"] = pred_loss_pp[i].item()
             metrics[f"eval/acc_{i}"] = pred_acc_pp[i].item()
 
+        # 额外损失用自身分子分母池化，和逐位置 accuracy 的 count 不混用。
+        # 主指标主要描述预测质量，附加指标用于判断辅助 head/蒸馏项是否学习正常。
         metrics.update(self._reduce_loss_components(all_step_metrics, "eval/"))
 
         if dist.get_rank() == 0:
@@ -555,6 +607,8 @@ class DFlashTrainer(Trainer):
     # Subclass contract implementations
     # ------------------------------------------------------------------
 
+    # 为前反向记录 CUDA Event；累加每个 microbatch 的有效分母，对原始分子 backward。
+    # 最后一个 microbatch 同步完成后才重标定全部梯度，公共基类随后进行裁剪和参数更新。
     def _train_step(
         self,
         batch: dict,
@@ -580,7 +634,10 @@ class DFlashTrainer(Trainer):
         ) = self._forward(batch)
         evt_fwd_e.record()
 
+        # 跨 batch 长度/mask 不同，分母不能假设相同；只反向分子，待窗口结束统一除总分母。
         loss_numerator, loss_denominator = loss_terms
+        # 累积窗口起点重置 denominator，后续 microbatch 原地相加。
+        # 这里 detach 是因为分母只用于归一化计数，不应把它连接进训练计算图。
         if batch_idx == 0:
             self._accumulated_loss_denominator = loss_denominator.detach().clone()
         else:
@@ -588,6 +645,8 @@ class DFlashTrainer(Trainer):
 
         evt_bwd_s.record()
         self._backward(loss_numerator, accumulation_steps=accumulation_steps)
+        # 公共循环已在最后一个 microbatch 打开梯度同步；backward 返回后再统一乘归一化系数。
+        # 优化器裁剪要在此之后，否则先裁未归一化的分子梯度会改变实际更新方向的尺度。
         if batch_idx == num_batches - 1:
             self._normalize_accumulated_gradients(
                 self._accumulated_loss_denominator,
@@ -595,6 +654,8 @@ class DFlashTrainer(Trainer):
             )
         evt_bwd_e.record()
 
+        # 前反向 Event 和 detached 指标留给窗口结束后汇总，原始图则可随当前 batch 释放。
+        # 额外 loss_components 保留各自的 (numerator,denominator) 统计，不在此提前平均。
         return {
             "loss": loss.detach(),
             "accuracy": accuracy.detach(),
@@ -607,6 +668,8 @@ class DFlashTrainer(Trainer):
             **loss_components,
         }
 
+    # 池化窗口指标后按 _anchor_slot_offset 选预测槽：DFlash 跳过第 0 槽，DSpark 从第 0 槽开始。
+    # 输出每个深度和整体统计，并读取前反向 Event 时间；此路径的标量读取会同步设备。
     def _aggregate_metrics(
         self, all_step_metrics: list[dict], step: int, *, grad_norm: torch.Tensor = None
     ) -> dict:
@@ -635,6 +698,8 @@ class DFlashTrainer(Trainer):
             cumulative *= pred_acc_pp[i].item()
             simulated_acc_len += cumulative
 
+        # 预测准确率按 count 池化；展示 loss 还带深度衰减权重。
+        # 当训练目标不是简单 decay CE 时，这个展示标量不能替代实际被优化的目标函数定义。
         avg_loss, avg_acc = self._compute_scalar_metrics(pred_loss_pp, pred_acc_pp, pred_count_pp)
 
         metrics = {
@@ -654,6 +719,8 @@ class DFlashTrainer(Trainer):
         metrics.update(self._reduce_loss_components(all_step_metrics, "train/"))
 
         # Sub-timing breakdown (forward vs backward)
+        # 前面多个 .item() 已使 CUDA 工作完成，才能安全读取事件间 elapsed_time。
+        # 这些分项和基类 compute_time 的覆盖范围不同；optimizer 位于基类最后一段 compute 之内。
         fwd_ms = sum(
             m["_fwd_events"][0].elapsed_time(m["_fwd_events"][1])
             for m in all_step_metrics

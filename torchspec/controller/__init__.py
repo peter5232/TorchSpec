@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：导出流水线控制器、推理调度器和装配/循环入口；本文件不执行训练作业。
+
 from torchspec.controller.inference_manager import AsyncInferenceManager
 from torchspec.controller.loop import run_training_loop
 from torchspec.controller.setup import (

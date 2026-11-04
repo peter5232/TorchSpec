@@ -18,11 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：注册各模型的角色头、结束符、系统提示和 parser 类型。
+# 这些常量是训练样本协议，不是供人阅读的排版；多一个换行也可能改变 tokenizer 输出。
+# 下面的各注册项由 parse.create_parser 消费；复杂 K3 协议另走 renderer 注册表。
+
 from typing import List
 
 from pydantic import BaseModel
 
 
+# Pydantic 校验的模板数据；描述分隔符和选择哪个 parser，不直接执行编码。
 class ChatTemplate(BaseModel):
     assistant_header: str | None
     user_header: str | None
@@ -33,19 +38,24 @@ class ChatTemplate(BaseModel):
     image_placeholder: str = "<image>"
 
 
+# 集中维护模型模板名，避免训练入口为每种模型复制数据处理代码。
 class TemplateRegistry:
+    # 初始化空模板字典，随后本文件逐项注册内置模板。
     def __init__(self):
         self.templates = {}
 
+    # 默认禁止同名模板重复注册，override=True 才允许明确替换。
     def register(self, name: str, template: ChatTemplate, override: bool = False):
         assert override or name not in self.templates, (
             f"Chat template for the model type {name} has already been registered"
         )
         self.templates[name] = template
 
+    # 获取模板对象供 parser 使用；不存在名称直接失败。
     def get(self, name: str) -> ChatTemplate:
         return self.templates[name]
 
+    # 返回已注册名称，用于输入校验及错误提示。
     def get_all_template_names(self) -> List[str]:
         return list(self.templates.keys())
 

@@ -18,6 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文阅读入口：这里是训练作业的装配层，不是模型 forward。
+# 阅读顺序：parse_config → _resolve_batch_size → train_async_no_generation → controller/loop.py。
+# 对熟悉单机 PyTorch 的读者：原来的 dataset/model/optimizer 被放进不同进程；
+# 这个进程只建立资源、启动远程工作并等待依赖。Ray 的 .remote() 返回未来结果，
+# ray.get 才等待其完成；因此代码顺序不等于 GPU 计算的实际完成顺序。
+
 """Training entry point for Eagle3 speculative decoding."""
 
 import argparse
@@ -61,14 +67,18 @@ from torchspec.utils.logging import init_tracking, logger
 _Phase = namedtuple("_Phase", ["name", "duration", "is_async", "blocked"])
 
 
+# 初始化阶段计时器：区分异步任务从提交到完成的总时长与主进程真正等待的时长。
+# 异步任务可以重叠，所以各阶段总时长之和不应当被当成整个初始化的耗时。
 class _InitTimer:
     """Lightweight segmented timer for initialization phases."""
 
+    # 记录总起点；已完成阶段和仍在运行的异步阶段分开保存，避免把尚未完成的工作计入报告。
     def __init__(self) -> None:
         self._t0 = time.time()
         self._phases: list[_Phase] = []
         self._pending: dict[str, float] = {}
 
+    # 给同步代码块包一层计时上下文；yield 期间运行调用者的代码，之后记录阶段耗时。
     @contextmanager
     def phase(self, name: str) -> Generator[None, None, None]:
         """Time a synchronous phase."""
@@ -76,10 +86,13 @@ class _InitTimer:
         yield
         self._phases.append(_Phase(name, time.time() - start, is_async=False, blocked=0.0))
 
+    # 在提交远程任务附近记录时间，不等待结果；同名阶段的起点会被更新。
     def begin_async(self, name: str) -> None:
         """Mark the start of an async operation (e.g., ray.remote dispatch)."""
         self._pending[name] = time.time()
 
+    # 等待 refs 的实际结果，并返回 ray.get 原样返回的值。
+    # 例如任务共运行 10 秒，主进程在第 8 秒才来等待：total≈10 秒，blocked≈2 秒。
     def wait(self, name: str, refs) -> Any:
         """Wrap ray.get for async phases. Returns the result."""
         if name not in self._pending:
@@ -93,6 +106,7 @@ class _InitTimer:
         self._phases.append(_Phase(name, total, is_async=True, blocked=blocked))
         return result
 
+    # 打印各阶段的总耗时和等待耗时，帮助区分模型加载本身慢与主进程被依赖阻塞。
     def log_summary(self) -> None:
         total = time.time() - self._t0
         lines = ["Initialization timing:"]
@@ -104,6 +118,9 @@ class _InitTimer:
         logger.info("\n".join(lines))
 
 
+# 将 YAML 和 CLI 覆盖项合成结构化配置，再转为历史调用接口使用的扁平 args。
+# 这里还派生并行规模和 batch 大小；offline 模式会补有限样本池，避免从磁盘过量灌入内存。
+# --print-config-only 在创建训练进程前退出，可先用它核对参数最终值。
 def parse_config():
     """Parse YAML config and convert to flat args.
 
@@ -166,6 +183,8 @@ def parse_config():
     return flat_args
 
 
+# decode 训练若启用投机算法却没有草稿权重路径，先从训练组导出初始草稿供引擎加载。
+# 该操作可能涉及所有训练 rank 的参数聚合，不能理解为任意时刻单进程保存一个 state_dict。
 def _maybe_create_scratch_draft(args, train_group):
     """Auto-create scratch draft checkpoint for inference engine if not provided."""
     if (
@@ -181,8 +200,14 @@ def _maybe_create_scratch_draft(args, train_group):
         logger.info(f"Set decode_speculative_draft_model_path = {scratch_dir}")
 
 
+# 把物理进程数转换为独立数据副本数，再计算一次 optimizer.step 实际消费的样本数。
+# 普通路径：global_batch = micro_batch × DP × accumulation；例如 2×4×3=24。
+# USP 路径中一个序列由 SP 个进程共同处理，所以 DP=world_size/SP，
+# per_dp_rank_batch_size 固定为 1，不能把同一序列在 SP rank 上的副本重复计为新样本。
 def _resolve_batch_size(args):
     """Derive dp_size, per_dp_rank_batch_size, dispatch_batch_size, and global_batch_size."""
+    # 这一处是 batch 推导函数内部的总进程数；例如两节点各 4 卡得到 world_size=8。
+    # DP=8 表示八份独立样本流；若 SP=4，则只有 DP=2 份独立样本流。
     world_size = args.training_num_nodes * args.training_num_gpus_per_node
     if getattr(args, "attention_backend", None) == "usp":
         sp_size = getattr(args, "sp_ulysses_size", 1) * getattr(args, "sp_ring_size", 1)
@@ -199,6 +224,8 @@ def _resolve_batch_size(args):
             )
         args.dp_size = dp_size
         args.sp_size = sp_size
+        # 四个 SP worker 各持一条序列的不同片段，整体仍算一条样本。
+        # 例如 world=8、SP=4、累积=3，此处 global_batch 为 1×2×3=6，不能乘成 24。
         args.per_dp_rank_batch_size = 1
     else:
         dp_size = getattr(args, "dp_size", None) or world_size
@@ -215,6 +242,8 @@ def _resolve_batch_size(args):
     args.global_batch_size = args.per_dp_rank_batch_size * dp_size * accumulation_steps
 
 
+# 在分配 GPU 前拒绝尚未支持的组合：当前 USP 仅允许 sgl、REPLICATE、micro_batch=1。
+# 这些是当前实现边界，不是序列并行在理论上必须具备的限制。
 def _validate_usp_args(args) -> None:
     if getattr(args, "attention_backend", None) != "usp":
         return
@@ -244,6 +273,7 @@ def _validate_usp_args(args) -> None:
         )
 
 
+# 优先读取明确提供的草稿配置，否则从目标模型结构派生配置；返回配置对象而非模型权重。
 def _get_draft_model_config(args):
     """Resolve draft model config from args or auto-generate from target model."""
 
@@ -258,6 +288,9 @@ def _get_draft_model_config(args):
     return AutoDraftModelConfig.from_dict(config_dict)
 
 
+# 检查 DFlash 系列所需的后端、block 大小、监督 token 数和目标层选择。
+# 至少 2×block_size 个监督 token 是该入口的校验条件；DFlash2 还要求两处配置严格一致，
+# 否则采集的特征层数或预测块几何与草稿网络期待的形状不同。
 def _validate_and_configure_dflash(args, draft_model_config) -> None:
     """Validate DFlash-specific config and auto-set aux layer IDs.
 
@@ -323,6 +356,10 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
         )
 
 
+# 装配完整训练流水线：控制器载入数据，同时预留资源和启动存储，然后创建训练/推理 actor。
+# 数据集大小决定训练步数，词表映射需要 tokenized 数据，因此这些依赖必须在模型开训前完成。
+# 名字保留了历史用法，实际也支持 train_with_decode；offline 则回放已采集的 teacher 特征。
+# 控制器持有数据集，主进程只拿大小和句柄，避免把整个数据集反复经 Ray 对象存储传输。
 def train_async_no_generation(args):
     """Entry point for Eagle3 asynchronous training.
 
@@ -342,6 +379,8 @@ def train_async_no_generation(args):
             configure_offline_args,
         )
 
+        # offline 记录已经确定 token 和 norm 边界，启动时先读取这份语义。
+        # 这里不从“当前引擎叫 offline”推导 post-norm，否则用 vLLM 采集的数据会被错误解释。
         offline_dataset = OfflineDataset(args.offline_data_path)
         configure_offline_args(offline_dataset, args)
 
@@ -358,12 +397,16 @@ def train_async_no_generation(args):
 
     # [1.5] Parse draft config + DFlash validation (before any async work)
     with timer.phase("Parse draft model config"):
+        # 不同草稿算法需要不同采集层和 block 约定；先解析并校验再异步加载大数据集。
+        # 例如 DFlash2 的显式层列表必须和推理采集列表一致，不能等收到张量后才碰 shape 错误。
         draft_model_config = _get_draft_model_config(args)
         args.draft_model_config_obj = draft_model_config
 
         _validate_and_configure_dflash(args, draft_model_config)
 
     # [2] Kick off dataset loading on controller (async — runs on actor while driver continues)
+    # 数据加载不依赖 GPU 模型，先发 RPC 让控制器并行执行。
+    # 下一段启动资源/存储时，CPU 可继续分词；直到需要数据长度时才等待这两个 refs。
     timer.begin_async("Dataset loading")
     dataset_size_ref = controller.load_dataset.remote(args)
     eval_dataset_size_ref = controller.load_eval_dataset.remote(args)
@@ -390,6 +433,8 @@ def train_async_no_generation(args):
         auto_calculate_training_steps(args, dataset_size)
 
     # [6] Generate vocab mapping on controller if vocab pruning is enabled
+    # 若输出词表裁剪，所有训练 rank 必须使用完全相同的列顺序。
+    # 在线可从本轮训练数据统计；offline 必须复用物化时的映射；已有权重映射也可明确保留。
     vocab_mapping = None
     draft_vocab_size = getattr(draft_model_config, "draft_vocab_size", None)
     vocab_size = draft_model_config.vocab_size
@@ -401,6 +446,8 @@ def train_async_no_generation(args):
                     "loaded draft weights, so no mapping is computed for this dataset"
                 )
             elif getattr(args, "inference_engine_type", None) == "offline":
+                # offline 回放没有重新统计任意语料的自由：输出列与 token 的关系已经在物化时确定。
+                # 缺少映射就失败，不能为凑维度临时生成一份看似合理的新映射。
                 mapping_path = os.path.join(args.offline_data_path, "vocab_mapping.pt")
                 if not os.path.isfile(mapping_path):
                     raise FileNotFoundError(
@@ -441,6 +488,9 @@ def train_async_no_generation(args):
         # are prepared, since they need decode_speculative_draft_model_path on args.
         # This blocks on train actor init (FSDP gather), so inference engines are
         # dispatched after to maximize parallelism with the wait below.
+        # 普通 prefill 可直接让训练与推理初始化并行；decode 投机引擎却可能先需要草稿权重文件。
+        # 这时导出 scratch 依赖训练 actor 已完成初始化及 FSDP 参数聚合，所以这个调用可能等待训练端。
+        # 必须在 prepare_inference_engines 前满足该依赖，否则引擎启动时拿不到草稿。
         _maybe_create_scratch_draft(args, train_group)
 
         inference_engines, engine_init_refs = prepare_inference_engines(
@@ -448,6 +498,8 @@ def train_async_no_generation(args):
         )
 
     # [8] Wait for all actor init to complete concurrently
+    # 训练与推理初始化 futures 合并等待，减少两边串行加载模型的总时间。
+    # 只对训练返回值检查一致性；两类 actor 的初始化结果协议不同，不能混成一个断言。
     n_train = len(train_init_refs)
     logger.info(
         f"Waiting for {n_train} training actors and {len(engine_init_refs)} "
@@ -462,11 +514,14 @@ def train_async_no_generation(args):
     )
 
     if vocab_mapping is not None:
+        # 等所有训练模型已构造好再装入统一映射；映射缓冲属于草稿输出语义，不能在不同 rank 自行随机选择。
         train_group.set_vocab_buffers(*vocab_mapping)
         logger.info("Loaded vocab mapping into training actors")
 
     # [9] Setup async training with pre-created controller
     with timer.phase("Setup async training"):
+        # 最后连接各 actor 的队列和独立存储客户端，至此数据协议与进程资源都已就绪。
+        # run_training_loop 将启动长期生产循环；前面只是装配，不会自动持续产生训练样本。
         controller, inference_manager = setup_async_training_with_engines(
             args, train_group, mooncake_config, inference_engines, controller=controller
         )

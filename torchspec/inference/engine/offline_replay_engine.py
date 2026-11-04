@@ -1,3 +1,5 @@
+# 离线回放把磁盘已有 teacher 张量重新发布到 Mooncake，复用在线训练的消费契约。
+# 它不运行 teacher 模型；工厂给它分配 CPU actor，并关闭 GPU Direct。
 """Inference-engine adapter that replays materialized target tensors from disk."""
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 from torchspec.utils.logging import logger, setup_file_logging
 
 
+# 保留与在线引擎相同的 generate 接口，使异步编排无需为磁盘数据另建消费路径。
 class OfflineReplayEngine(InferenceEngine, RayActor):
     """Serve recorded target-model outputs through the normal Mooncake contract.
 
@@ -25,6 +28,7 @@ class OfflineReplayEngine(InferenceEngine, RayActor):
     a live engine.
     """
 
+    # 初始化数据集、存储及按 data_id 检索的索引占位；此时尚未读取记录正文。
     def __init__(self, args, rank: int, engine_group: int = 0, **_kwargs) -> None:
         self.args = args
         self.rank = rank
@@ -34,6 +38,7 @@ class OfflineReplayEngine(InferenceEngine, RayActor):
         self._rows_by_id: dict[str, dict[str, Any]] = {}
         setup_file_logging("offline_replay", rank, group=engine_group)
 
+    # 复制配置并禁用 GPU Direct，读取 train/eval 索引且拒绝跨 split 重复 ID，再建立 CPU 存储客户端。
     def init(self, mooncake_config=None) -> None:
         if mooncake_config is None:
             raise ValueError("OfflineReplayEngine requires a Mooncake configuration")
@@ -66,6 +71,7 @@ class OfflineReplayEngine(InferenceEngine, RayActor):
             self.args.offline_data_path,
         )
 
+    # 按 ID 定位磁盘记录，为本次发布生成新键，写入四种可选张量并带回原 mask 和元数据。
     def _replay_one(self, data_id: str) -> dict[str, Any]:
         if self._dataset is None or self._mooncake_store is None:
             raise RuntimeError("OfflineReplayEngine not initialized. Call init() first.")
@@ -96,6 +102,7 @@ class OfflineReplayEngine(InferenceEngine, RayActor):
             "metadata": metadata,
         }
 
+    # 以磁盘记录为准，接口中的实时输入和返回标志不参与回放；逐 ID 发布后 flush 确保读者可取数据。
     def generate(
         self,
         data_id: str | list[str],
@@ -119,10 +126,12 @@ class OfflineReplayEngine(InferenceEngine, RayActor):
         self._mooncake_store.flush()
         return outputs
 
+    # 数据集与存储都存在才算就绪；不扫描磁盘或检测远端服务健康。
     def health_check(self, timeout: float = 5.0) -> bool:
         del timeout
         return self._dataset is not None and self._mooncake_store is not None
 
+    # 关闭客户端并清空索引和数据集引用，释放回放占用的本地资源。
     def shutdown(self) -> None:
         if self._mooncake_store is not None:
             self._mooncake_store.close()
@@ -131,6 +140,7 @@ class OfflineReplayEngine(InferenceEngine, RayActor):
         self._rows_by_id.clear()
         logger.info("OfflineReplayEngine rank %d shutdown complete", self.rank)
 
+    # 返回记录数和数据路径，便于确认 actor 加载了哪一批离线样本。
     def get_status(self) -> dict:
         return {
             "rank": self.rank,

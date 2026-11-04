@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：把已经创建的推理引擎、训练组和控制器连起来。
+# 本模块只确定连接和步数，不执行网络 forward。队列传递样本描述，Mooncake 承载张量。
+
 """Pipeline setup: mooncake config, training steps calculation, async training setup."""
 
 import math
@@ -28,6 +31,7 @@ from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import logger
 
 
+# 将扁平 mooncake_* 参数交给统一配置类解析，使各 actor 连接同一存储服务。
 def build_mooncake_config(args):
     """Build MooncakeConfig from flat args namespace."""
     from torchspec.config.mooncake_config import MooncakeConfig
@@ -35,6 +39,9 @@ def build_mooncake_config(args):
     return MooncakeConfig.from_flat_args(args)
 
 
+# 复用或新建控制器，创建推理调度 actor，再将训练/评估队列传给训练组。
+# 训练队列按派生 batch 大小读取；评估队列一次读取单条，随后由 eval_micro_batch_size 重新组批。
+# mooncake_config 是连接参数而不是跨进程共享的 store 对象，每个 actor 自行初始化客户端。
 def setup_async_training_with_engines(
     args, train_group, mooncake_config, inference_engines, controller=None
 ):
@@ -87,6 +94,9 @@ def setup_async_training_with_engines(
     return controller, inference_manager
 
 
+# 把样本数换算为 optimizer 步数，而不是推理批次数或梯度累积次数。
+# 例如 1000 条、global_batch=32，整数除法得到每 epoch 31 步；未凑满的尾部不单独加一步。
+# 显式 num_train_steps 优先，显式 lr_total_steps 也保留；小于一个 global batch 时至少设 1 步。
 def auto_calculate_training_steps(args, dataset_size: int):
     """Auto-calculate num_train_steps and lr_total_steps based on dataset size if not explicitly set.
 

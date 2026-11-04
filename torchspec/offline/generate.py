@@ -1,3 +1,6 @@
+# 中文导读：特征物化作业。复用在线推理和控制器，但消费者换成保存 actor，不执行草稿反向传播。
+# 与离线训练相对：本文件负责“生成离线数据”，offline_replay_engine 负责“读取离线数据供训练”。
+
 """Materialize live target-model outputs for offline training."""
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import logger
 
 
+# 解析生成目录、覆盖开关和训练配置；借用 batch 推导但明确禁止当前未支持的 USP 物化。
 def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", "-c", required=True)
@@ -45,6 +49,7 @@ def _parse_args():
     return cli, args
 
 
+# 若草稿裁剪词表，连同数据保存 d2t/t2d 映射，回放时保持输出列与 token 的相同对应。
 def _save_vocab_mapping(controller, output_dir: str, draft_config) -> None:
     draft_vocab_size = getattr(draft_config, "draft_vocab_size", None)
     if draft_vocab_size is None or draft_vocab_size == draft_config.vocab_size:
@@ -58,6 +63,9 @@ def _save_vocab_mapping(controller, output_dir: str, draft_config) -> None:
     os.replace(temporary, path)
 
 
+# 建立真实推理引擎、单消费者队列和磁盘保存器，逐条持久化训练/验证样本。
+# 每 dispatch 一条可保留数据尾部；有界输出池降低磁盘慢于 GPU 时的积压，不是严格的物理内存上限。
+# 循环同时跟踪预期数和已处理数：若所有输入/任务/输出都耗尽却未达到预期，显式失败而非静默少样本。
 def materialize(args, output_dir: str, *, overwrite: bool = False) -> dict[str, int]:
     if getattr(args, "inference_engine_type", None) == "offline":
         raise ValueError("Materialization requires a live inference engine")
@@ -67,7 +75,11 @@ def materialize(args, output_dir: str, *, overwrite: bool = False) -> dict[str, 
     _validate_and_configure_dflash(args, draft_config)
     # A one-item dispatch lets the saving actor persist every source sample,
     # including a final partial inference batch.
+    # 物化要保存每一条原始样本，不希望像优化器训练那样丢掉不足 global batch 的尾部。
+    # 控制器用 DP=1 且每次一条，因此无论引擎批大小如何，最后剩余样本也可逐条消费。
     args.per_dp_rank_batch_size = 1
+    # 先建立磁盘格式元信息，尤其记录最后隐状态是否 pre-norm；后续回放必须复用这一语义。
+    # overwrite 参数会沿构造路径删除已有目录，阅读/使用这个入口时要区分普通续写和明确覆盖。
     OfflineDataset(
         output_dir,
         create=True,
@@ -84,19 +96,27 @@ def materialize(args, output_dir: str, *, overwrite: bool = False) -> dict[str, 
     train_size, eval_size = ray.get(
         [controller.load_dataset.remote(args), controller.load_eval_dataset.remote(args)]
     )
+    # 裁剪词表的映射是数据语义的一部分，一并保存使回放训练不用重新根据其他语料选词。
+    # 若重新选词，同一 lm_head 列可能对应不同 token，即便所有张量维度看起来正确。
     _save_vocab_mapping(controller, output_dir, draft_config)
 
+    # 这里只分配推理 GPU；保存 actor 使用 CPU 并从 Mooncake 下载，不创建草稿训练进程。
+    # 因此物化与训练可以在不同时间使用硬件，而不是要求两组模型同时驻留。
     inference_pg = create_placement_groups(args, roles={"inference"})["inference"]
     launch_mooncake_master(args)
     mooncake_config = build_mooncake_config(args)
     engines = create_inference_engines(args, inference_pg, mooncake_config)
 
+    # 单写者 actor 维护 manifest，避免多个进程同时追加同一清单导致索引竞争。
+    # Ray 队列里仍是 TrainSample，生产者无须知道下游究竟做反向传播还是写磁盘。
     saver = OfflineSavingActor.remote(output_dir, mooncake_config)
     train_queues, eval_queues = ray.get(
         [controller.get_train_queues.remote(), controller.get_eval_queues.remote()]
     )
     ray.get(saver.set_queues.remote(train_queues[0], eval_queues[0]))
 
+    # 默认给待消费结果池一个有限条数阈值，降低磁盘慢于 GPU 时的积压。
+    # 它不统计所有在途输出的物理字节，因此不构成“内存绝不超限”的硬保证。
     if getattr(args, "max_sample_pool_size", 0) <= 0:
         args.max_sample_pool_size = max(
             8,
@@ -110,15 +130,21 @@ def materialize(args, output_dir: str, *, overwrite: bool = False) -> dict[str, 
         inference_engines=engines,
         max_concurrent_batches=getattr(args, "max_concurrent_batches", 1),
     )
+    # 先提交验证条目，再提交训练条目；下面消费循环也先尝试 eval。
+    # 两条队列仍然分开，写入清单时 split 不会因处理顺序而丢失。
     if eval_size:
         ray.get(controller.submit_eval_chunk.remote(0, eval_size))
     ray.get(controller.submit_training_dataset.remote())
 
     manager_future = manager.run.remote()
+    # processed 计本次已消费的队列条目，dataset.count 则计去重后的磁盘记录。
+    # 例如 ID 已在旧数据集里，append 返回 False，但这条推理结果已经被消费，所以 processed 仍加一。
     expected = {"train": train_size, "eval": eval_size}
     processed = {"train": 0, "eval": 0}
     counts = None
     try:
+        # 这个 try/finally 从 manager 启动后的处理阶段开始；更早的初始化失败不在同一个清理范围内。
+        # 不要因为看见 finally 就推断任意阶段异常都必然释放了此前创建的全部资源。
         while processed != expected:
             made_progress = False
             for split, method in (
@@ -137,6 +163,8 @@ def materialize(args, output_dir: str, *, overwrite: bool = False) -> dict[str, 
             manager_status, controller_status = ray.get(
                 [manager.get_status.remote(), controller.get_full_status.remote()]
             )
+            # 只有管理器输入/任务、控制器输入/训练结果、评估结果五处都空，才判断生产流已经耗尽。
+            # 若此时 processed 未达到 expected，就说明有样本未成功产出；应报错而不是返回一个悄悄变小的数据集。
             drained = (
                 manager_status["prompt_buffer_size"] == 0
                 and manager_status["pending_tasks"] == 0
@@ -152,9 +180,12 @@ def materialize(args, output_dir: str, *, overwrite: bool = False) -> dict[str, 
 
         if eval_size:
             ray.get(controller.finalize_eval_dispatch.remote())
+        # 返回值来自去重后的实际磁盘索引，不把本次 processed 当作最终数据集大小。
         counts = ray.get(saver.counts.remote())
     finally:
         try:
+            # 先关闭读取/保存客户端，再复用通用引擎停机流程，最后向控制器队列投递结束信号。
+            # 逐段捕获清理异常并记录，尽量不让次生清理错误遮盖原始失败。
             ray.get(saver.close.remote())
         except Exception as exc:
             logger.warning("Failed to close offline saver: %s", exc)
@@ -168,6 +199,7 @@ def materialize(args, output_dir: str, *, overwrite: bool = False) -> dict[str, 
     return counts
 
 
+# 命令行入口：解析后启动物化，overwrite 原样传递给数据目录创建逻辑。
 def main() -> None:
     cli, args = _parse_args()
     materialize(args, cli.output, overwrite=cli.overwrite)

@@ -1,3 +1,7 @@
+# 中文导读：离线回放格式由 dataset.json（语义）、manifest.jsonl（索引）和 samples/*.pt（张量）组成。
+# 先昂贵地采集一次 teacher 特征，之后训练反复回放；代价是磁盘容量和读写吞吐。
+# 最后层是否已过 norm 随数据保存，不能根据当前选中的 offline 后端重新猜测。
+
 """Small on-disk dataset used by offline replay."""
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ OFFLINE_SCHEMA_VERSION = 1
 _TENSOR_NAMES = ("input_ids", "hidden_states", "target", "last_hidden_states")
 
 
+# 维护 train/eval 两个清单及按 data_id 查询的索引；载入清单时不把全部张量读进内存。
 class OfflineDataset:
     """Read and append replay records.
 
@@ -23,6 +28,8 @@ class OfflineDataset:
     ``manifest.jsonl``, and self-describing ``samples/*.pt`` files.
     """
 
+    # 可创建或打开目录，校验格式版本、norm 约定、split、ID 唯一性和文件路径。
+    # overwrite=True 会删除已有目录；普通读取不覆盖。索引路径须位于数据根目录内。
     def __init__(
         self,
         root: str | os.PathLike[str],
@@ -91,15 +98,20 @@ class OfflineDataset:
                     self._rows[split].append(item)
                     self._by_id[data_id] = item
 
+    # 返回指定 split 的列表副本，调用者重排列表不改变内部顺序；行字典仍是浅共享。
     def rows(self, split: str) -> list[dict[str, str]]:
         return list(self._rows[split])
 
+    # 生成 split 内 ID 集合，供去重或恢复处理进度。
     def ids(self, split: str) -> set[str]:
         return {row["data_id"] for row in self._rows[split]}
 
+    # 返回清单条数，不扫描张量文件，也不重新校验磁盘内容。
     def count(self, split: str) -> int:
         return len(self._rows[split])
 
+    # 按 ID/清单项使用 CPU mmap 读取张量字典，验证 ID 及必要的输入/辅助特征。
+    # mmap 减少立即读取全部文件的压力，实际访问页面时仍可能发生磁盘 I/O。
     def load(self, row_or_id: dict[str, str] | str) -> dict[str, Any]:
         row = self._by_id[str(row_or_id)] if isinstance(row_or_id, str) else row_or_id
         path = self.root / row["file"]
@@ -114,6 +126,9 @@ class OfflineDataset:
             raise ValueError(f"Offline sample has missing tensors: {path}")
         return record
 
+    # 已存在同 split 的 ID 返回 False；新样本 detach 后存 CPU 连续张量，再提交清单记录。
+    # 先写临时文件并原子替换，随后 fsync 清单，避免清单指向尚未写好的半文件。
+    # 文件名用 ID 哈希；它是命名策略，不是张量内容校验。这里按单写者使用，没有多写者锁。
     def append(
         self,
         split: str,
@@ -152,6 +167,8 @@ class OfflineDataset:
         os.close(fd)
         try:
             torch.save(record, temporary)
+            # 发布最终文件名之前内容已完成写入；消费者通过清单发现文件时应看到完整记录。
+            # 但样本文件和清单不是一个跨文件事务，异常可能留下未被清单引用的孤立文件。
             os.replace(temporary, path)
         finally:
             if os.path.exists(temporary):
@@ -172,6 +189,7 @@ class OfflineDataset:
         return True
 
 
+# 用数据记录的 pre/post norm 语义覆盖运行参数；缺少该字段立即失败，避免 teacher 概率算错。
 def configure_offline_args(dataset: OfflineDataset, args) -> None:
     """Use the representation detail recorded with the tensors."""
     value = dataset.metadata.get("last_hidden_states_prenorm")

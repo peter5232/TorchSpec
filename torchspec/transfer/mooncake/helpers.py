@@ -18,9 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 纯容量辅助函数：把模型维度转成传输缓冲字节预算，供配置和错误信息使用。
+# 预算基于辅助隐状态、token 和可选最后隐状态，不包含词表 logits 或任意额外张量。
+
 from torchspec.utils.logging import logger
 
 
+# 以 1024 为进位格式化字节数，负值保留原始 B 表示；只影响日志展示，不参与内存分配。
 def _format_bytes(size: int) -> str:
     """Format bytes in a human-readable form."""
     if size < 0:
@@ -33,6 +37,8 @@ def _format_bytes(size: int) -> str:
         value /= 1024
 
 
+# 计算 B×S×(2KH+8+可选 2H)，乘安全余量后向上对齐 256 字节。
+# 例如 B=1、S=4、H=8、K=3 且含最后隐状态，原始为 288 字节；余量 1.1 后对齐得到 512 字节。
 def calculate_eagle3_buffer_size(
     max_seq_len: int,
     batch_size: int,

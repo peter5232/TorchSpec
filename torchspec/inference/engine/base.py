@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 定义训练数据生产者的共同生命周期；调用方通过 Ray 调度，具体后端负责前向和张量发布。
+# generate 在这里表示生产 teacher 训练数据，不保证每个实现都生成新 token。
+
 """Abstract base class for inference engines."""
 
 from abc import ABC, abstractmethod
@@ -27,6 +30,7 @@ import ray
 import torch
 
 
+# 抽象接口统一初始化、数据生产、状态查询和回收；GPU 放置能力由具体类混入 RayActor 提供。
 class InferenceEngine(ABC):
     """Abstract interface for inference engines.
 
@@ -34,6 +38,7 @@ class InferenceEngine(ABC):
     RayActor for distributed deployment via Ray placement groups.
     """
 
+    # 模型和传输资源应在 actor 被调度到目标节点后创建，避免在驱动进程提前占用 GPU。
     @abstractmethod
     def init(self, mooncake_config=None) -> None:
         """Initialize the engine on the allocated GPU.
@@ -44,6 +49,8 @@ class InferenceEngine(ABC):
             mooncake_config: MooncakeConfig object for distributed storage.
         """
 
+    # 输入可以是 token 张量引用或已格式化文本；结果通常是每条样本的 Mooncake 键及解释字节所需的元数据。
+    # 这是后端共享的签名，各实现支持的参数不同，应继续阅读具体 generate 的校验和返回字段。
     @abstractmethod
     def generate(
         self,
@@ -72,6 +79,7 @@ class InferenceEngine(ABC):
             List of dicts with mooncake_key or tensors.
         """
 
+    # 向上层暴露当前引擎的存储配置；未设置时返回 None，不创建新的客户端连接。
     def get_mooncake_config(self):
         """Get the mooncake configuration.
 
@@ -79,14 +87,17 @@ class InferenceEngine(ABC):
         """
         return getattr(self, "_mooncake_config", None)
 
+    # 约定轻量健康查询接口；具体实现多只检查初始化状态，不能等同一次真实模型前向测试。
     @abstractmethod
     def health_check(self, timeout: float = 5.0) -> bool:
         """Check if the engine is healthy."""
 
+    # 约定释放模型、后台进程和存储连接的入口，由具体后端决定清理顺序。
     @abstractmethod
     def shutdown(self) -> None:
         """Clean up resources."""
 
+    # 返回可经 Ray 传输的小字典供监控使用，不返回模型权重或隐状态张量。
     @abstractmethod
     def get_status(self) -> dict:
         """Get engine status."""

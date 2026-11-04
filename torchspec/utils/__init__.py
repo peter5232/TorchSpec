@@ -18,4 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 公共工具包命名空间：分布式组、日志、张量对齐与诊断工具分别在子模块实现，本文件无初始化副作用。
+
 """Utility package for torchspec."""

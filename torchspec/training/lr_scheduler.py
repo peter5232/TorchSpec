@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 统一学习率曲线：warmup 后接 constant/linear/cosine/inverse-square-root/WSD。
+# 这里的 step 是 scheduler 的优化器步计数，不是 token 数或推理请求编号。
+
 """Unified learning rate schedulers for torchspec training."""
 
 import math
@@ -51,6 +54,7 @@ class LRSchedulerWithWarmup(LRScheduler):
         last_epoch: The index of last epoch. Defaults to -1.
     """
 
+    # 规范化超参数并校验上下界/总步数；WSD 必须指定最后衰减阶段长度，再交父类建立计数。
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -88,6 +92,8 @@ class LRSchedulerWithWarmup(LRScheduler):
             f"LR scheduler: decay_style={decay_style}, warmup={warmup_steps}, total={total_steps}"
         )
 
+    # 优先读取参数组局部上下界；warmup 线性升温，后续按已扣 warmup 的比例计算衰减。
+    # constant 分支先于超总步数检查，因此该模式始终保持 max_lr；其他模式超过总步数返回 min_lr。
     def _get_lr_for_group(self, param_group: dict) -> float:
         """Compute learning rate for a specific parameter group."""
         max_lr = param_group.get("max_lr", self.max_lr)
@@ -109,6 +115,8 @@ class LRSchedulerWithWarmup(LRScheduler):
             lr = max_lr * warmup_steps**0.5 / (num_steps**0.5)
             return max(min_lr, lr)
 
+        # 衰减比例从 warmup 结束算起，而不是简单 step/total_steps。
+        # 例如总 100 步、warmup=10，第 55 步处于衰减段中点 (55-10)/(100-10)=0.5。
         num_steps_ = step - self.warmup_steps
         decay_steps_ = self.total_steps - self.warmup_steps
         decay_ratio = float(num_steps_) / float(decay_steps_)
@@ -125,8 +133,12 @@ class LRSchedulerWithWarmup(LRScheduler):
         else:
             raise ValueError(f"Unknown decay style: {self.decay_style}")
 
+        # 系数描述在 [min_lr,max_lr] 区间内的位置，并非直接乘原始 lr。
+        # 若 min=1e-5、max=1e-4、coeff=0.5，则结果为 5.5e-5，而不是 5e-5。
         return min_lr + coeff * delta_lr
 
+    # 在 total_steps-wsd_decay_steps 之前保持系数 1，最后一段才按所选曲线从 1 降到 0。
+    # 例如 total=100、decay=20，80 步前稳定，80 到 100 步衰减；decay_ratio 参数当前未参与计算。
     def _compute_wsd_coeff(self, step: int, decay_ratio: float) -> float:
         """Compute coefficient for WSD (Warmup-Stable-Decay) schedule."""
         wsd_anneal_start = self.total_steps - self.wsd_decay_steps
@@ -147,10 +159,12 @@ class LRSchedulerWithWarmup(LRScheduler):
         else:
             raise ValueError(f"Unknown WSD decay style: {self.wsd_decay_style}")
 
+    # 逐参数组计算当前学习率列表，供 PyTorch LRScheduler 写回 optimizer。
     def get_lr(self) -> list[float]:
         return [self._get_lr_for_group(group) for group in self.optimizer.param_groups]
 
 
+# 从现有参数组取最大初始 lr 作为峰值，构造线性 warmup 加 cosine 曲线的兼容入口。
 def CosineAnnealingWarmupLR(
     optimizer: torch.optim.Optimizer,
     total_steps: int,
@@ -177,6 +191,7 @@ def CosineAnnealingWarmupLR(
     )
 
 
+# 显式把曲线配置转交统一调度器，不另维护一套计算公式。
 def get_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     max_lr: float,
@@ -206,6 +221,8 @@ def get_lr_scheduler(
     Returns:
         Configured LRSchedulerWithWarmup instance.
     """
+    # 工厂不复制参数到 optimizer，也不额外前进一步；曲线初始化交给统一 scheduler 构造器。
+    # 所有 WSD 特定参数原样传入，让缺失或未知曲线在同一个实现中验证，避免入口间规则分叉。
     return LRSchedulerWithWarmup(
         optimizer,
         max_lr=max_lr,
@@ -220,6 +237,8 @@ def get_lr_scheduler(
     )
 
 
+# 由推理样本总量除以每次 DP batch 大小估算训练步数，并回写 args.train_iters/lr_decay_iters。
+# warmup 优先使用比例，其次使用绝对步数，再构造同一调度器。
 def get_lr_scheduler_from_args(args, optimizer: torch.optim.Optimizer) -> LRSchedulerWithWarmup:
     """Create scheduler from training args namespace (for FSDP actor compatibility).
 
@@ -230,6 +249,8 @@ def get_lr_scheduler_from_args(args, optimizer: torch.optim.Optimizer) -> LRSche
     Returns:
         Configured LRSchedulerWithWarmup instance.
     """
+    # 这里依据生产规模估计完整 DP batch 数：生成样本总数除以每次消费样本数。
+    # 整数除法丢弃不足一整 batch 的余数，不能把它当作任意数据流都精确成立的终止条件。
     train_iters = (
         args.num_inference
         * args.inference_batch_size
@@ -241,6 +262,8 @@ def get_lr_scheduler_from_args(args, optimizer: torch.optim.Optimizer) -> LRSche
     lr_decay_iters = getattr(args, "lr_decay_iters", None) or train_iters
     args.lr_decay_iters = lr_decay_iters
 
+    # warmup_fraction 的分母是 lr_decay_iters，不一定是原估计 train_iters。
+    # 因此用户显式改变衰减总步数，也会改变按比例设置的 warmup 步数。
     if getattr(args, "lr_warmup_fraction", None) is not None:
         warmup_steps = int(args.lr_warmup_fraction * lr_decay_iters)
     else:

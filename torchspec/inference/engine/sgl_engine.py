@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# SGLang 适配器依赖带 spec_training 支持的后端：它执行前向并直接写 Mooncake，本层只整理请求和键。
+# 普通 generate 仅做 prefill；真正生成 completion 的训练数据入口位于 sgl_engine_decode.py。
+
 """
 Sgl Ray actor engine for distributed deployment across multiple nodes.
 
@@ -72,6 +75,7 @@ _USP_SHARDED_MOONCAKE_ENV_KEYS = (
 )
 
 
+# 把训练的序列并行布局传给后端写入端；切回非 USP 时清除旧环境变量，避免复用进程残留错误分片配置。
 def _configure_usp_sharded_mooncake_env(args: Any, max_seq_length: int | None) -> None:
     values: dict[str, str] = {}
     if getattr(args, "attention_backend", None) == "usp":
@@ -92,6 +96,7 @@ def _configure_usp_sharded_mooncake_env(args: Any, max_seq_length: int | None) -
             os.environ.pop(name, None)
 
 
+# 通过 RayActor 部署 SGLang，同时混入 decode 辅助能力；两种数据生产方式共享模型与传输配置。
 class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
     """Ray actor wrapper for sgl.Engine with distributed deployment support.
 
@@ -102,6 +107,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
     Accepts pre-tokenized input_ids and loss_mask instead of raw prompts.
     """
 
+    # 保存本节点 GPU 数及跨节点 rank；模型、存储和维度信息都延迟到 init 创建。
     def __init__(
         self,
         args,
@@ -134,6 +140,8 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         self.local_gpu_id = None
         setup_file_logging("inference", self.rank, group=engine_group)
 
+    # 配置 Mooncake、辅助层和 TP 拓扑后启动 SGLang；普通 prefill 禁用 CUDA graph，decode 分支加入采样相关配置。
+    # 端口由工厂预分配，多节点的非零节点参与模型通信但不作为外部请求入口。
     def init(
         self,
         mooncake_config=None,
@@ -193,6 +201,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 mooncake_config.metadata_server,
             )
 
+        # 此开关必须同时影响后端写入和本类返回的字段，否则消费者会等待一个从未写出的 _lhs。
         self._store_last_hidden_states = getattr(self.args, "store_last_hidden_states", True)
 
         # Get configuration
@@ -214,6 +223,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         # tp_size: sglang tp_size is the TOTAL TP degree across all nodes
         # e.g. 3 nodes × 8 GPUs → tp_size=24
         nnodes = getattr(self.args, "sglang_nnodes", 1)
+        # SGLang 使用整个跨节点副本的 TP 总度数；这里不是单节点 GPU 数。
         tp_size = nnodes * self.num_gpus_per_engine
         configured_tp_size = getattr(self.args, "sglang_tp_size", None)
         if configured_tp_size is not None:
@@ -259,6 +269,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         max_seq_length = getattr(self.args, "max_seq_length", None)
         _configure_usp_sharded_mooncake_env(self.args, max_seq_length)
 
+        # 先接收可覆盖的普通选项，再写集成必需配置，防止外部设置破坏辅助层捕获协议。
         engine_kwargs.update(
             {
                 "model_path": self.args.target_model_path,
@@ -296,6 +307,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
             f"SglEngine rank {self.rank}: pre_allocated_port is required "
             "(ports must be pre-allocated by the factory)"
         )
+        # HTTP/调度相关端口与 NCCL 端口使用相邻一对；每个 actor 使用工厂分配的不同候选。
         engine_kwargs["port"] = pre_allocated_port
         engine_kwargs["nccl_port"] = pre_allocated_port + 1
 
@@ -320,6 +332,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         if self.node_rank >= 1:
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
 
+        # 启动真实引擎及子进程后再取得模型维度；多节点 worker 的非阻塞启动由上方环境开关控制。
         self._engine = sgl.Engine(**engine_kwargs)
 
         # Get hidden size from model config
@@ -346,6 +359,8 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
             f"hidden_size={self._hidden_size})"
         )
 
+    # 为每个请求保留一层列表，没有图像的条目用 [] 占位；整批都无图像才返回 None。
+    # 例如 [无图, 两张图] 转成 [[], [图甲, 图乙]]，避免后端按首项误判整个批次格式。
     @staticmethod
     def _extract_image_data(multimodal_inputs: list[dict] | None) -> list | None:
         """Extract image_data list from multimodal_inputs for sgl.Engine.
@@ -367,6 +382,8 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 image_data.append([])
         return image_data if has_images else None
 
+    # 解析唯一的文本或 token 输入，为后端传入 max_new_tokens=0，并从返回值读取真实序列长度和发布键。
+    # 文本模式无法自行可靠推断 token 数，必须依赖 prompt_tokens；无键时此实现跳过该结果。
     def generate(
         self,
         data_id: str | list[str],
@@ -401,6 +418,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
 
         use_prompts = formatted_prompts is not None
 
+        # 两种输入都转成批次请求，但分词发生位置不同：文本延迟到后端，token 列表已确定长度。
         if use_prompts:
             batch_size = len(formatted_prompts)
         else:
@@ -410,6 +428,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 input_ids_list = input_ids_ref
             batch_size = len(input_ids_list)
 
+        # 单个批次 ID 展开成带下标的样本 ID；显式 ID 列表必须与批次等长。
         if isinstance(data_id, str):
             data_ids = [f"{data_id}_{i}" for i in range(batch_size)]
         elif len(data_id) == batch_size:
@@ -452,6 +471,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 "return_hidden_states": True,
             }
 
+        # 图像列表保留与文本相同的批次位置，不能只收集有图样本而改变顺序。
         image_data = self._extract_image_data(multimodal_inputs)
         if image_data is not None:
             engine_kwargs["image_data"] = image_data
@@ -473,6 +493,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 f"SglEngine rank {self.rank}: result meta_info keys: {list(result['meta_info'].keys())}"
             )
 
+            # 当前实现允许一个后端结果返回多个存储键；普通 prefill 路径缺键会跳过，与 decode 保留 None 的行为不同。
             for key in store_keys:
                 seq_len = result["meta_info"].get("prompt_tokens")
                 if seq_len is None:
@@ -485,6 +506,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                     else:
                         seq_len = len(input_ids_list_of_lists[i])
 
+                # 以后端实际 prompt_tokens 为准，避免自动截断或图像展开后仍按原输入长度声明字节数。
                 tensor_shapes = self._get_tensor_shapes(seq_len)
                 logger.debug(
                     f"SglEngine rank {self.rank}: mooncake_key={key}, seq_len={seq_len}, "
@@ -506,10 +528,12 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         )
         return outputs
 
+    # 只检查 SGLang 实例是否存在，并未验证子进程是否还能执行前向。
     def health_check(self, timeout: float = 5.0) -> bool:
         """Check if the engine is healthy."""
         return self._engine is not None
 
+    # 关闭存储与 SGLang 子进程，再清空引用，避免 actor 退出后继续占用设备。
     def shutdown(self) -> None:
         """Clean up resources."""
         if self._mooncake_store is not None:
@@ -520,6 +544,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
             self._engine = None
         logger.info(f"SglEngine rank {self.rank}: shutdown complete")
 
+    # 返回 rank、GPU 基址和 hidden_size 等小型状态，供控制端诊断。
     def get_status(self) -> dict:
         """Get engine status."""
         return {
@@ -529,6 +554,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
             "hidden_size": self._hidden_size,
         }
 
+    # 从模型配置读取隐藏维度；多模态配置若把文本模型嵌在 text_config 内则向内查找。
     def _get_hidden_size_from_engine(self) -> int:
         """Get hidden size from the model config using AutoConfig.
 
@@ -548,6 +574,8 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 hidden_size = getattr(text_config, "hidden_size", None)
         return hidden_size
 
+    # 为单样本构造 [S, K×H] 辅助隐状态、[S] token 和可选 [S, H] 最后隐状态。
+    # 例如三层、H=4096 时最后一维为 12288，而不是新增一个大小为 3 的层轴。
     def _get_tensor_shapes(self, seq_len: int) -> dict:
         """Get tensor shapes for mooncake metadata.
 
@@ -581,6 +609,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
             shapes["last_hidden_states"] = (seq_len, hidden_size)
         return shapes
 
+    # 按存储协议声明隐状态 BF16、token int64；是否包含最后隐状态与 shape 开关保持一致。
     def _get_tensor_dtypes(self) -> dict:
         """Get tensor dtypes for mooncake metadata."""
         dtypes = {

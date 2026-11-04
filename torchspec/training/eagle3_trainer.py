@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Eagle 训练适配层：把 teacher 特征变成多步训练目标，连接 draft、FSDP 和公共训练循环。
+# 这里的展开深度是训练监督位置；simulated_acc_len 是统计近似，不执行线上接受/拒绝采样。
+
 from argparse import Namespace
 from typing import List, Optional, Tuple
 
@@ -38,6 +41,7 @@ from torchspec.utils.tensor import padding
 from torchspec.utils.train_dump import dump_eagle3_batch
 
 
+# 返回长度为 n 的深度权重；显式列表必须精确匹配，否则默认第 i 步为 0.8**i。
 def _position_decay_weights(n: int, weights: Optional[list[float]] = None) -> list[float]:
     """Per-position TTT loss weights.
 
@@ -58,6 +62,7 @@ class Eagle3Trainer(Trainer):
     and metric aggregation.
     """
 
+    # 在公共训练状态上缓存各深度损失权重及其总和，并预留双缓冲 CPU 指标存储。
     def __init__(self, args: Namespace):
         super().__init__(args)
         self.target_lm_head: Optional[torch.nn.Module] = None
@@ -67,6 +72,9 @@ class Eagle3Trainer(Trainer):
         self._ploss_weight_sum = sum(self._ploss_weights)
         self._metric_buffers: list[torch.Tensor] = []
 
+    # rank 0 加载初始 draft/teacher embedding，其他 rank 用 meta 构造；冻结 embedding 后统一广播。
+    # 将训练 wrapper 按 grad_sync_mesh 包装，建立 FP32 master 优化器并恢复检查点，最后载入冻结 teacher head。
+    # warm start 的全词表 head 可先用 teacher 补齐旧裁剪词表缺失行；embedding 最后加载以保证 teacher 权重优先。
     def init_model(
         self,
         draft_model_config: AutoDraftModelConfig,
@@ -84,6 +92,8 @@ class Eagle3Trainer(Trainer):
 
         init_context = self._get_init_weight_context_manager()
 
+        # 初始化分两层：先建 draft 网络，再建负责展开和 loss 的 Eagle3Model。
+        # 非主 rank 的 meta 参数只有 shape/dtype；不能在真实权重广播前进行有效前向或导出。
         with init_context():
             draft_model = AutoEagle3DraftModel.from_config(
                 draft_model_config,
@@ -97,6 +107,7 @@ class Eagle3Trainer(Trainer):
         # a warm start, so the rows a pruned EAGLE3 checkpoint lacks start from the target; the
         # checkpoint then overwrites what it has. The resume path is resolved rather than merely
         # present: load() skips a load_path that resolves to nothing.
+        # 判定的是实际可解析的续训目录；仅填写了不存在的 load_path 不应阻止 teacher 初始化。
         seed_lm_head_from_target = not checkpoint.resolve_resume_model_dir(self.args) and (
             (freeze_lm_head and not initial_draft_model_path)
             or bool(initial_draft_model_path)
@@ -123,6 +134,8 @@ class Eagle3Trainer(Trainer):
                 embedding_key=getattr(self.args, "embedding_key", "model.embed_tokens"),
             )
 
+        # teacher embedding 是输入语义空间的固定坐标；把它冻结后不占优化器 master/moment。
+        # 可选冻结 lm_head 与冻结 embedding 是两个不同决策；前者会改变 checkpoint 中可训练参数集合。
         draft_model.freeze_embedding()
         frozen_parts = ["embedding"]
         if freeze_lm_head:
@@ -148,6 +161,8 @@ class Eagle3Trainer(Trainer):
             loss_type=getattr(self.args, "loss_type", "forward_kl"),
             lk_eta=getattr(self.args, "lk_eta", 3.0),
         )
+        # 训练展开可选 anchor 采样 wrapper，但仍把同一个 draft_model 放进统一的训练接口。
+        # anchor 控制选哪些位置展开，并不是在线生成时创建多少条独立请求。
         if num_anchors:
             eagle3_model = AnchoredEagle3Model(
                 num_anchors=num_anchors, anchor_max_gap=anchor_max_gap, **model_kwargs
@@ -159,6 +174,8 @@ class Eagle3Trainer(Trainer):
         else:
             eagle3_model = Eagle3Model(**model_kwargs)
 
+        # 先记录 rank 0 构造的完整状态，再对模型应用分布式包装。
+        # 随后 set_model_state_dict 负责把完整值放进包装后的布局；顺序反过来可能拿到分片而非原始完整权重。
         full_state = eagle3_model.state_dict() if dist.get_rank() == 0 else {}
 
         midlayer_modules = [
@@ -193,6 +210,8 @@ class Eagle3Trainer(Trainer):
             wsd_ratio = getattr(self.args, "lr_wsd_decay_ratio", 0.2)
             wsd_decay_steps = int(wsd_ratio * self.args.lr_total_steps)
             wsd_decay_style = getattr(self.args, "lr_wsd_decay_style", "cosine")
+        # optimizer 必须在分布式模型布局确定之后创建，master/grad buffer 才与实际参数布局一致。
+        # 调度器以 optimizer step 为单位；TTT 深度更多并不会自动多推进几次学习率。
         self.optimizer = BF16Optimizer(
             self.draft_model,
             lr=self.args.learning_rate,
@@ -208,6 +227,8 @@ class Eagle3Trainer(Trainer):
         self.lr_scheduler = self.optimizer.lr_scheduler
 
         checkpoint_payload = checkpoint.load(self)
+        # load 读模型与优化器，finalize_load 才处理 RNG、global_step 和 continual-training master。
+        # 两步共同完成恢复；只执行 load 并不等价于整个训练状态已经准备好。
         checkpoint.finalize_load(self, checkpoint_payload)
 
         self._last_hs_prenorm = getattr(self.args, "last_hidden_states_prenorm", False)
@@ -223,6 +244,8 @@ class Eagle3Trainer(Trainer):
         self.target_lm_head_weight = self.target_lm_head.lm_head.weight
         self.verifier_norm = self.target_lm_head.norm
 
+        # 可选注意力内核预热在正式 profiler 启动之前执行。
+        # 这把首次编译/特化成本与稳态训练分开；它不是又执行一次带梯度的训练样本。
         if getattr(self.args, "attention_backend", None) == "fa4":
             from torchspec.models.draft.llama3_eagle import (
                 _has_cute_dsl,
@@ -251,6 +274,7 @@ class Eagle3Trainer(Trainer):
     # Eagle3-specific helpers
     # ------------------------------------------------------------------
 
+    # 从 teacher 同步加载冻结 lm_head；只有输入最后层特征为 pre-norm 时才额外加载 norm。
     def _init_target_lm_head(self, target_model_path: str) -> None:
         """Initialize TargetLMHead for computing logits from last_hidden_states.
 
@@ -271,6 +295,9 @@ class Eagle3Trainer(Trainer):
     # Forward / backward
     # ------------------------------------------------------------------
 
+    # 把 [B,S] token 和 [B,S,H] teacher 末层特征向左移一位并尾部补零，与下一 token 监督对齐。
+    # pre-norm 特征先经冻结 norm；裁剪词表路径计算压缩概率，全词表路径传递惰性目标避免常驻 [B,S,V]。
+    # 辅助层特征不做同样的左移；位置、attention mask、loss mask 一起传给训练 wrapper。
     def _forward(
         self, batch: dict
     ) -> Tuple[
@@ -287,11 +314,14 @@ class Eagle3Trainer(Trainer):
             with torch.no_grad():
                 target_hidden_states = self.verifier_norm(target_hidden_states)
 
+        # loss_mask 保留原位置布局，具体各展开深度的可监督位置由 Eagle wrapper 处理。
+        # 这里仅移除兼容输入的末尾单例维，不能像 input_ids 一样无条件再左移一次。
         loss_mask = batch["loss_mask"]
         if loss_mask.dim() == 3:
             loss_mask = loss_mask.squeeze(-1)
         loss_mask = loss_mask.cuda()
 
+        # t2d 标识目标词表中保留的 token；裁剪后的监督概率与 draft head 的输出维必须一致。
         if self.t2d is not None:
             target = compute_target_p_padded(
                 target_hidden_states=target_hidden_states,
@@ -306,8 +336,12 @@ class Eagle3Trainer(Trainer):
                 self.target_lm_head_weight,
                 self.eagle3.length,
             )
+        # 显式释放本地引用，避免不再需要的中间量延长驻留。
+        # 但惰性目标若仍引用其底层 tensor，实际存储仍会存活到目标计算完成；del 不是强制释放 CUDA 内存。
         del target_hidden_states
 
+        # 模型输入同时包括 student 的辅助特征和 teacher 监督目标，两条用途不同。
+        # 返回 plosses 用于 backward，vlosses 用于日志；统计 count 必须保留，才能跨不同 mask 密度正确池化。
         plosses, vlosses, acces, acc_counts, alphas = self.model(
             input_ids=input_ids,
             attention_mask=batch["attention_mask"].cuda(),
@@ -320,6 +354,8 @@ class Eagle3Trainer(Trainer):
         )
         return plosses, vlosses, acces, acc_counts, alphas
 
+    # 将各展开深度 loss 乘权重后求和，再除 microbatch 累积次数并 backward。
+    # 注意这里不除权重总和；日志 avg_loss 除权重和，因而日志尺度与实际反向标量不同。
     def _backward(self, plosses: List[torch.Tensor], accumulation_steps: int = 1) -> torch.Tensor:
         ploss = (
             sum(self._ploss_weights[i] * plosses[i] for i in range(len(plosses)))
@@ -332,6 +368,7 @@ class Eagle3Trainer(Trainer):
     # Eval (no-grad forward on CPU-cached data)
     # ------------------------------------------------------------------
 
+    # no_grad 前向返回逐深度 loss、accuracy、有效计数和 alpha 的 detached 向量，不更新优化器。
     def eval_forward(self, batch: dict) -> dict:
         """Single forward pass without backward — returns per-position metrics."""
         with torch.no_grad():
@@ -343,6 +380,7 @@ class Eagle3Trainer(Trainer):
             "alphas": torch.stack(alphas).detach(),
         }
 
+    # 把 CPU 缓存按评估 batch 大小重新 collate，转 GPU 后收集指标；结束后恢复 train 模式。
     def eval_from_cache(self) -> dict:
         """Run forward-only eval over all CPU-cached eval samples.
 
@@ -370,6 +408,9 @@ class Eagle3Trainer(Trainer):
 
         return self._aggregate_eval_metrics(all_metrics)
 
+    # accuracy 和 alpha 先乘有效 token 数、跨 chunk/rank 累加，再统一相除。
+    # 例如 1 个 token 全对与 9 个 token 全错应得 0.1，不能把两个 batch accuracy 平均成 0.5。
+    # vloss 则保持 chunk 均值再跨 rank AVG；连续准确率乘积之和只用于估计接受长度。
     def _aggregate_eval_metrics(self, all_step_metrics: list[dict]) -> dict:
         if not all_step_metrics:
             return {}
@@ -387,6 +428,9 @@ class Eagle3Trainer(Trainer):
             dim=0
         )
 
+        # 所有 rank 都参与归约，不能只让 rank 0 执行此函数。
+        # 损失按当前实现先求本地 chunk 均值，再 AVG；准确率/alpha 是总分子/总有效数。
+        # 两种统计口径并不相同，特别是最后一个评估 batch 较小时。
         dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG)
         dist.all_reduce(acc_counts, op=dist.ReduceOp.SUM)
         dist.all_reduce(acc_correct, op=dist.ReduceOp.SUM)
@@ -399,6 +443,9 @@ class Eagle3Trainer(Trainer):
         avg_acc_scalar = avg_acces.mean().item()
         avg_alpha_scalar = avg_alphas.mean().item()
 
+        # 此指标假设用各深度 accuracy 的乘积近似连续正确的概率。
+        # 例如 a=[0.8,0.5,0.25]，结果为 0.8+0.4+0.1=1.3；
+        # 真实接受率还受路径相关性、采样分布等影响，不能把 1.3 当成现场解码测量。
         cumulative = 1.0
         simulated_acc_len = 0.0
         for i in range(avg_acces.shape[0]):
@@ -436,6 +483,7 @@ class Eagle3Trainer(Trainer):
     # Subclass contract implementations
     # ------------------------------------------------------------------
 
+    # 调用前向和按累积次数缩放的反向；返回 detached 指标避免汇总列表持有整张计算图。
     def _train_step(
         self,
         batch: dict,
@@ -458,6 +506,7 @@ class Eagle3Trainer(Trainer):
             "total_loss": total_loss.detach(),
         }
 
+    # 把 Eagle 每深度 loss/accuracy 与公共循环抓取的梯度、权重写入统一 debug dump。
     def _save_dump_data(
         self,
         *,
@@ -480,6 +529,8 @@ class Eagle3Trainer(Trainer):
             model_weights=model_weights,
         )
 
+    # 每优化器步更新 MoE router bias；对准确率/alpha 累加分子分母，对 vloss 取均值。
+    # 把所有指标打包成一个 float32 张量，用两个 pinned CPU buffer 轮换非阻塞复制，交给下一步兑现。
     def _aggregate_metrics(
         self, all_step_metrics: list[dict], step: int, *, grad_norm: torch.Tensor = None
     ) -> dict | DeferredTrainMetrics:
@@ -506,6 +557,8 @@ class Eagle3Trainer(Trainer):
         ).sum(dim=0)
 
         num_depths = avg_vlosses.shape[0]
+        # 把三个长度为 depth 的向量拼成一次归约，减少小标量 collective 的次数。
+        # 打包顺序也是 _build_train_metrics 的解包协议；修改两端任一端都要保持一致。
         weighted_counts = torch.cat((acc_correct_sum, acc_counts_sum, alpha_weighted_sum))
         dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG)
         dist.all_reduce(weighted_counts, op=dist.ReduceOp.SUM)
@@ -529,6 +582,7 @@ class Eagle3Trainer(Trainer):
         metric_step = self.global_step
         learning_rate = self.optimizer.get_learning_rate()
 
+        # 闭包固定本次 global_step、学习率和深度数，延迟读取时仍生成本步而非下步的指标。
         def finalize_values(metric_values: list[float]) -> dict:
             return self._build_train_metrics(
                 metric_values,
@@ -540,6 +594,8 @@ class Eagle3Trainer(Trainer):
         if packed_metrics.device.type != "cuda":
             return finalize_values(packed_metrics.tolist())
 
+        # 每个 CPU buffer 大小为 4*depth+1：loss、correct、count、alpha_sum 和范数。
+        # 首次分配后反复使用，假定本次训练的深度固定；pin_memory 是非阻塞 D2H 的关键前提。
         if not self._metric_buffers:
             self._metric_buffers = [
                 torch.empty(
@@ -550,9 +606,12 @@ class Eagle3Trainer(Trainer):
                 )
                 for _ in range(2)
             ]
+        # 两个 buffer 对应交替步号：本步复制不覆盖仍待兑现的上一步 CPU 数值。
         cpu_values = self._metric_buffers[metric_step % len(self._metric_buffers)]
         cpu_values.copy_(packed_metrics, non_blocking=True)
         ready_event = torch.cuda.Event()
+        # 事件记录在 copy_ 之后，所以等待事件意味着 CPU 数组可读取。
+        # DeferredTrainMetrics 同时持有 packed_metrics 的强引用，防止源存储在异步复制完成前被回收复用。
         ready_event.record()
         return DeferredTrainMetrics(
             cpu_values=cpu_values,
@@ -562,6 +621,8 @@ class Eagle3Trainer(Trainer):
             finalize_values=finalize_values,
         )
 
+    # 解包 [loss, correct, count, alpha_sum, grad_norm]，用 max(count,1) 避免空监督除零。
+    # 连续接受长度近似为 a0+a0*a1+…；如准确率 [0.8,0.5] 得 1.2，并非实测解码吞吐。
     def _build_train_metrics(
         self,
         metric_values: list[float],
@@ -585,6 +646,8 @@ class Eagle3Trainer(Trainer):
             for alpha, count in zip(alpha_weighted_values, acc_counts_values)
         ]
 
+        # 现在已经是 Python float 列表，求均值/构造字典不会再触发每个 CUDA 标量一次同步。
+        # 此处 loss 除权重和用于稳定展示尺度，但 _backward 的加权和未除权重和。
         weighted_avg_loss_value = (
             sum(loss * weight for loss, weight in zip(ploss_values, self._ploss_weights))
             / self._ploss_weight_sum
@@ -597,6 +660,8 @@ class Eagle3Trainer(Trainer):
             cumulative *= acc
             simulated_acc_len_value += cumulative
 
+        # metric_step 和 learning_rate 来自创建延迟对象时的快照。
+        # 若此时重新读取 optimizer 当前 lr/global_step，日志会被错误地标到已经开始的下一步。
         metrics = {
             "train/avg_loss": weighted_avg_loss_value,
             "train/avg_acc": avg_acc_scalar,

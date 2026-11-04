@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# FlexAttention 编译入口和 EAGLE3 causal+对角 suffix 的稀疏掩码构造。
+# 索引元数据同时含 forward 的 KV 方向和 backward 的 Q 方向；FULL 块可跳过逐元素 mask 判断。
 from functools import lru_cache
 
 import torch
@@ -55,12 +57,14 @@ class WrappedFlexAttention:
     _is_flex_compiled = False
     _compiled_flex_attention = None
 
+    # 进程内只创建一个包装实例，反复请求不会产生新的编译函数对象。
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
             # Create a new instance if one doesn't already exist
             cls._instance = super().__new__(cls)
         return cls._instance
 
+    # 首次创建 torch.compile(flex_attention)，初始化禁用外层递归捕获，随后复用同一 callable。
     @torch.compiler.disable(recursive=False)
     def __init__(self):
         """
@@ -72,10 +76,12 @@ class WrappedFlexAttention:
             )
             self._is_flex_compiled = True
 
+    # 返回已缓存的编译函数本身；真正的 Q/K/V 调用由 compile_friendly 包装器执行。
     def __call__(self):
         return self._compiled_flex_attention
 
 
+# 外部 eager 调用使用缓存编译函数，已在 torch.compile 捕获中则直接调用原始 flex，避免嵌套编译问题。
 def compile_friendly_flex_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -98,6 +104,8 @@ def compile_friendly_flex_attention(
 _compiled_create_block_mask = None
 
 
+# 单个 128×128 以内的小形状保持 eager，较大形状懒初始化 dynamic=True 的 mask builder。
+# DFlash 的锚点每步变化，mask 构建本身的开销也需控制，不能只优化 attention kernel。
 def compile_friendly_create_block_mask(
     mask_mod,
     B,
@@ -136,6 +144,7 @@ def compile_friendly_create_block_mask(
     )
 
 
+# 把首轮因果区域与后续同槽对角区域作 OR；每行代表一条训练链而不是 packed 样本集合。
 def generate_eagle3_mask(Q_LEN: int, KV_LEN: int, lck: int = 0):
     """Eagle3 causal+suffix mask_mod.
 
@@ -146,9 +155,11 @@ def generate_eagle3_mask(Q_LEN: int, KV_LEN: int, lck: int = 0):
     are tautological on every valid q row and are omitted.
     """
 
+    # q>=kv 自然只覆盖首轮前缀：后续 kv 已大于所有当前 q，不会误入因果区域。
     def causal_mask(b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
 
+    # 要求 kv 在首轮之后，且 (kv-q) 是 Q_LEN 的整数倍，保证每轮只连接同一序列槽。
     def suffix_mask(b, h, q_idx, kv_idx):
         return (kv_idx >= Q_LEN) & ((kv_idx - q_idx) % Q_LEN == 0)
 
@@ -157,6 +168,9 @@ def generate_eagle3_mask(Q_LEN: int, KV_LEN: int, lck: int = 0):
     return mask_mod
 
 
+# 不物化 Q×KV 布尔网格，直接用块号公式构造八组 count/index 张量。
+# Q_BS/KV_BS=r：每个 Q 块有 r 个首轮三角 PARTIAL 块，每个后续轮也有 r 个对角 PARTIAL 块。
+# 索引表仍按 n_q×n_kv 的宽度补齐，节省的是 token 级网格，不是严格 O(非零块数) 的紧凑存储。
 def _build_eagle3_block_mask_tensors(
     Q_LEN: int,
     KV_LEN: int,
@@ -213,6 +227,7 @@ def _build_eagle3_block_mask_tensors(
 
     # PARTIAL: r diagonal + r * (n_rounds - 1) suffix per Q-block.
     # Round s in [0, n_rounds): kj in [qi*r + s*n_kv_causal, (qi+1)*r + s*n_kv_causal).
+    # 例如 Q_BS=256、KV_BS=128、两轮时，每个 Q 块有 4 个 PARTIAL KV 块；其余首轮下三角块为 FULL。
     partial_count = r * n_rounds
     s_b = col_kv // r  # which round
     sub_b = col_kv % r  # offset within round
@@ -233,6 +248,7 @@ def _build_eagle3_block_mask_tensors(
     # PARTIAL: every kj has exactly 1 partial Q-block (the diagonal Q-block).
     #   Causal kj: qi = kj // r.
     #   Suffix kj: qi = (kj % n_kv_causal) // r.
+    # 反向需知道每个 KV 块被哪些 Q 块使用；suffix 每个 KV 块仅对应一个 Q 块，不能套首轮下三角列表。
     q_idx_diag = torch.where(is_causal_kj, kj // r, (kj % n_kv_causal) // r)
     q_idx_2d = torch.where(
         col_q == 0,
@@ -254,9 +270,11 @@ def _build_eagle3_block_mask_tensors(
     )
 
     # flex_attention iterates these directly; force contiguous storage.
+    # 将块计数复制成 [B,H,n_blocks] 连续张量，满足 kernel 读取的批/头布局。
     def _expand_1d(t):
         return t.unsqueeze(0).unsqueeze(0).expand(B, H, -1).contiguous()
 
+    # 将块索引表扩成 [B,H,n_rows,n_cols] 并连续化，未用槽由 count 限制读取。
     def _expand_2d(t):
         return t.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1).contiguous()
 
@@ -277,6 +295,7 @@ def _build_eagle3_block_mask_tensors(
 _compiled_build_tensors = None
 
 
+# 懒编译纯张量构造器并缓存；不把携带 Python mask 闭包的 BlockMask 对象作为编译返回值。
 @torch.compiler.disable(recursive=False)
 def _get_compiled_build_tensors():
     global _compiled_build_tensors
@@ -289,6 +308,7 @@ def _get_compiled_build_tensors():
     return _compiled_build_tensors
 
 
+# 整数解释为方块，二元组解释为 (Q_BS,KV_BS)，支持 Blackwell 的 256×128 矩形 tile。
 def _normalize_block_size(BLOCK_SIZE) -> tuple[int, int]:
     """Accept BLOCK_SIZE as int or (Q_BS, KV_BS) tuple; return (Q_BS, KV_BS)."""
     if isinstance(BLOCK_SIZE, int):
@@ -297,6 +317,8 @@ def _normalize_block_size(BLOCK_SIZE) -> tuple[int, int]:
     return int(Q_BS), int(KV_BS)
 
 
+# 校验序列/块对齐与完整轮数，生成稀疏元数据，再包装带精确元素谓词的 BlockMask。
+# FULL 是首轮严格下三角块，PARTIAL 含对角与 suffix；两者分开让 kernel 减少 mask 求值。
 def build_eagle3_block_mask(
     Q_LEN: int,
     KV_LEN: int,
@@ -323,6 +345,7 @@ def build_eagle3_block_mask(
     fully-causal-below-diagonal blocks (skip mask_mod evaluation).
     """
     Q_BS, KV_BS = _normalize_block_size(BLOCK_SIZE)
+    # 解析公式依赖整块和完整轮，边缘不齐形状必须由外层 dispatcher 走通用 builder。
     assert Q_LEN % Q_BS == 0 and KV_LEN % KV_BS == 0
     assert Q_BS % KV_BS == 0, f"Q_BS ({Q_BS}) must be a multiple of KV_BS ({KV_BS})"
     assert KV_LEN % Q_LEN == 0, (
@@ -331,6 +354,7 @@ def build_eagle3_block_mask(
     )
 
     # Skip the compiled path when nested inside another torch.compile graph.
+    # 已处于外层 torch.compile 时直接用纯张量函数；eager 调用才使用独立编译缓存，避免嵌套捕获问题。
     builder = (
         _build_eagle3_block_mask_tensors
         if is_torchdynamo_compiling()
@@ -340,11 +364,13 @@ def build_eagle3_block_mask(
         Q_LEN, KV_LEN, B, H, Q_BS, KV_BS, device
     )
 
+    # 对边界 PARTIAL 块执行精确 token 级判断：首轮因果，后续按 Q_LEN 余数匹配同槽。
     def mask_mod(b, h, q, kv):
         causal = (kv < Q_LEN) & (q >= kv)
         suffix = (kv >= Q_LEN) & ((kv - q) % Q_LEN == 0)
         return causal | suffix
 
+    # Python 容器携带元素谓词，tensor builder 只生成可编译的元数据；二者分层便于保持 dynamic KV 长度。
     return BlockMask(
         seq_lengths=(Q_LEN, KV_LEN),
         kv_num_blocks=kv_num,
@@ -360,6 +386,7 @@ def build_eagle3_block_mask(
     )
 
 
+# 满足块对齐和整轮条件时走解析构造，否则走通用 create_block_mask，保持小尺寸测试也可用。
 def _make_eagle3_block_mask(
     Q_LEN: int,
     KV_LEN: int,
@@ -396,9 +423,11 @@ def _make_eagle3_block_mask(
         pattern.
     """
     Q_BS, KV_BS = _normalize_block_size(BLOCK_SIZE)
+    # 四项条件分别约束 Q/KV 块对齐、矩形块可整分、缓存由完整 Q_LEN 轮组成。
     use_analytical = (
         Q_LEN % Q_BS == 0 and KV_LEN % KV_BS == 0 and Q_BS % KV_BS == 0 and KV_LEN % Q_LEN == 0
     )
+    # 正常长序列训练优先解析构造，避免每深度重建 token 级布尔矩阵。
     if use_analytical:
         return build_eagle3_block_mask(
             Q_LEN=Q_LEN,
@@ -412,6 +441,7 @@ def _make_eagle3_block_mask(
     # Fallback for non-aligned shapes (typically only seen in tests).
     # TODO: Remove the usage of uncompiled create_block_mask after
     # https://github.com/pytorch/pytorch/issues/160018
+    # 非对齐和小测试形状保留通用 fallback；小 Q 不强制编译，减少单块编译边界问题。
     creator = create_block_mask if Q_LEN <= 128 else compile_friendly_create_block_mask
     return creator(
         mask_mod=generate_eagle3_mask(Q_LEN=Q_LEN, KV_LEN=KV_LEN, lck=lck),
@@ -424,6 +454,7 @@ def _make_eagle3_block_mask(
     )
 
 
+# 用形状、设备、块尺寸和深度为 LRU 键复用只读 mask；缓存对象不可由调用方原地修改。
 @lru_cache(maxsize=128)
 def _cached_eagle3_block_mask(
     Q_LEN: int,
@@ -446,6 +477,7 @@ def _cached_eagle3_block_mask(
     )
 
 
+# 外层编译中直接构造；eager 时解析 CUDA 当前设备编号后查 LRU，避免 cuda 字符串跨设备误复用。
 def eagle3_block_mask(
     Q_LEN: int,
     KV_LEN: int,

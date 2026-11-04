@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# MTP 的硬标签目标：用第 t 行隐藏状态预测 x[t+2]，与普通 next-token CE 的一位偏移不同。
+
 """Hard-label cross entropy for an MTP layer."""
 
 from __future__ import annotations
@@ -37,6 +39,9 @@ class MTPObjective:
     targets: Optional[torch.Tensor] = None
 
 
+# 只保留 loss_mask[:,2:] 有效的目标，以 hidden_states[:,:-2] 对齐，最后两行没有标签。
+# 如 token=[a,b,c,d]，前两行监督 c、d；无有效目标时返回与图相连的零 loss，仍可 backward。
+# normalizer 可用全局有效目标数，此时先求 CE 总和再除它；keep_logits 只保留 detached 调试输出。
 def compute_mtp_objective(
     model,
     hidden_states: torch.Tensor,

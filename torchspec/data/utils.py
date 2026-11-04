@@ -18,6 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：数据形状、监督 mask 和数据源读取的公共工具。
+# 先读 pack/unpack/resolve_loss_mask，再读 collator：前者确定训练语义，后者只把变长样本拼成矩形张量。
+# 注意输入列表中的单样本常带 [1,T] 或 [1,T,H] 维度，cat 后才得到 [B,T] / [B,T,H]。
+
 import json
 import os
 from pathlib import Path
@@ -32,6 +36,7 @@ from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 _LOCAL_DATA_EXTS = frozenset({".json", ".jsonl", ".parquet", ".arrow", ".csv", ".tsv", ".txt"})
 
 
+# 用路径前缀、常见扩展名或磁盘存在性区分本地路径与 Hub ID；可相对指定基目录探测。
 def is_local_data_path(path: str, base_dir: str | None = None) -> bool:
     """True if *path* looks like a local file/directory rather than a HF Hub dataset ID.
 
@@ -46,11 +51,14 @@ def is_local_data_path(path: str, base_dir: str | None = None) -> bool:
     return os.path.exists(probe)
 
 
+# 对齐变长 token/特征/mask 后沿 batch 维拼接；不是 tokenizer，也不重新推断 assistant 区间。
 class DataCollatorWithPadding:
+    # 保存是否使用 USP；普通路径另做长度分桶，USP 则保留调用方给的 attention mask。
     def __init__(self, usp_enabled: bool = False):
         self.sp_degree = 1
         self.usp_enabled = usp_enabled
 
+    # 将 [B,n,H] 沿序列维补零或截为 [B,N,H]；保持 dtype/device，不动 hidden 维。
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n, S = intensors.shape
         # Truncate if longer than target (can happen when loss_mask/hidden_states
@@ -63,6 +71,7 @@ class DataCollatorWithPadding:
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
+    # 将 [B,n] ID/mask 沿序列维对齐到 N；mask 补零使新增 padding 不参与监督/有效上下文。
     def paddingtensor2D(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n = intensors.shape
         # Truncate if longer than target (prevents negative padding dimension
@@ -75,6 +84,7 @@ class DataCollatorWithPadding:
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
+    # 要求上游已经附上张量 mask；缺失则报错，而不是猜一个全一 mask 混入训练。
     def _get_loss_mask(self, item: Dict[str, Any]) -> torch.Tensor:
         """Read the materialized loss_mask tensor from the item.
 
@@ -85,6 +95,9 @@ class DataCollatorWithPadding:
             return item["loss_mask"]
         raise KeyError(f"loss_mask not found in item: {item}")
 
+    # 找到批内最大长度，普通路径再向上对齐到 128 的倍数，以减少编译器遇到的新形状。
+    # 例如长度 130 和 200 都补到 256；token/hidden 可以补零，但 attention/loss mask 必须同时屏蔽这些位置。
+    # USP 保留已有位置与注意力信息；可选 target/last_hidden_states 仅在全批均有时拼接。
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         max_length = max(item["input_ids"].shape[1] for item in features)
         max_length = ((max_length + self.sp_degree - 1) // self.sp_degree) * self.sp_degree
@@ -95,6 +108,8 @@ class DataCollatorWithPadding:
             # Round up to nearest bucket to reduce unique shapes for torch.compile.
             # Without this, every batch gets a different padded length, causing
             # FlexAttention recompilation (~1s overhead per new shape).
+            # 编译器常按形状缓存图/内核；长度 129、130、131 若都产生新形状，就可能反复编译。
+            # 分桶让它们都走 256 长度的计算，用一些 padding 算力换取更少的编译和稳定运行。
             _BUCKET = 128
             max_length = ((max_length + _BUCKET - 1) // _BUCKET) * _BUCKET
             attention_masks = [torch.ones_like(item["input_ids"]).long() for item in features]
@@ -105,6 +120,8 @@ class DataCollatorWithPadding:
         batch_attention_mask = torch.cat(
             [self.paddingtensor2D(mask, max_length) for mask in attention_masks]
         )
+        # 输入 padding token 的数值不够表达“无效”，必须在 mask 中明确排除。
+        # 例如原序列长度 3 补到 128，新增 125 个位置不能被当作 125 个真实监督样本。
         batch_loss_mask = torch.cat(
             [self.paddingtensor2D(self._get_loss_mask(item), max_length) for item in features]
         )
@@ -146,6 +163,8 @@ class DataCollatorWithPadding:
         return batch
 
 
+# 把二值 mask 编码成从零段开始的交替段长，压缩连续的用户/助手区域。
+# 例如 [1,1,0,1] → [0,2,1,1]，开头的 0 不可省，否则解码时零/一奇偶性会颠倒。
 def pack_loss_mask(loss_mask: torch.Tensor) -> List[int]:
     """
     Pack a loss_mask tensor into interleaved segment lengths.
@@ -186,6 +205,7 @@ def pack_loss_mask(loss_mask: torch.Tensor) -> List[int]:
     return lengths
 
 
+# 按段索引奇偶恢复一维 long mask；奇数段填一，偶数段保持零，空输入返回空张量。
 def unpack_loss_mask(packed: Union[List[int], str]) -> torch.Tensor:
     """
     Unpack segment lengths back into a loss_mask tensor.
@@ -218,6 +238,9 @@ def unpack_loss_mask(packed: Union[List[int], str]) -> torch.Tensor:
     return loss_mask
 
 
+# 优先用存储的 packed mask 并对齐到实际长度；否则按真实 token 的角色边界动态匹配。
+# 已算出但全零的 mask 返回 None 表示无可训练位置；两种策略都不适用时返回长度 1 的全一占位值。
+# 函数还会将有效 mask 写回 data；多模态必须事先删除旧 packed mask，否则优先级会阻止重算。
 def resolve_loss_mask(
     data: Dict[str, Any],
     *,
@@ -275,6 +298,7 @@ def resolve_loss_mask(
     return torch.ones(1)
 
 
+# 段长列表转逗号字符串，便于经过引擎/RPC 元数据通道，不需要传一个长 mask 张量。
 def serialize_packed_loss_mask(packed: List[int]) -> str:
     """
     Serialize packed loss_mask to a comma-separated string.
@@ -292,6 +316,7 @@ def serialize_packed_loss_mask(packed: List[int]) -> str:
     return ",".join(str(x) for x in packed)
 
 
+# 将逗号字符串恢复为整数段长；这里仅解析，不做总长或非负校验，上层契约负责验证。
 def deserialize_packed_loss_mask(s: str) -> List[int]:
     """
     Deserialize a comma-separated string back to packed loss_mask.
@@ -311,6 +336,7 @@ def deserialize_packed_loss_mask(s: str) -> List[int]:
     return [int(x) for x in s.split(",")]
 
 
+# 只提取图片/视频引用，不下载媒体；缺失地址仍保留 None 位置，避免破坏占位符对应次序。
 def extract_media_urls(messages: list) -> dict | None:
     """Extract image/video URLs from structured messages without loading them."""
     images = []
@@ -346,6 +372,7 @@ def extract_media_urls(messages: list) -> dict | None:
     return {"images": images or None, "videos": videos or None}
 
 
+# 就地将结构化 content 改为文本和媒体占位符，必须先提取 URL，否则结构信息会丢失。
 def flatten_multimodal_content(messages, image_placeholder="<image>"):
     """Convert list-type content parts to plain text strings.
 
@@ -383,6 +410,8 @@ def flatten_multimodal_content(messages, image_placeholder="<image>"):
     return messages
 
 
+# 优先取离线 seq_len，再取 token 数，最后用格式化文本字符数作粗略成本估计。
+# 字符数不是严格单调的 token 数，跨语言时尤其只是启发式；它不参与模型位置计算。
 def sample_length_hint(sample: Dict[str, Any]) -> int:
     """Sequence length of a stored dataset entry, for length grouping.
 
@@ -397,6 +426,8 @@ def sample_length_hint(sample: Dict[str, Any]) -> int:
     return len(sample["formatted_prompt"])
 
 
+# 只在固定大小的小组内按长度降序重排，保留组间随机次序。
+# 这样减少同批 padding，同时避免全局从短到长/长到短排序把数据变成长度课程。
 def length_grouped_order(samples: List[Any], group_size: int) -> List[Any]:
     """Sort *samples* longest-first within fixed chunks of *group_size*.
 
@@ -415,6 +446,7 @@ def length_grouped_order(samples: List[Any], group_size: int) -> List[Any]:
     return ordered
 
 
+# 为进度条估计本地 JSONL 行数或 Parquet 元数据行数，不支持/读取失败返回 None。
 def estimate_row_count(data_path):
     if not os.path.isfile(data_path):
         return None
@@ -433,6 +465,7 @@ def estimate_row_count(data_path):
     return None
 
 
+# 根据首字符区分 JSON 数组与逐行 JSON，逐条 yield；JSONL 空行跳过。
 def load_local_json(data_path):
     with open(data_path, "r", encoding="utf-8") as f:
         first_char = f.read(1)
@@ -446,6 +479,7 @@ def load_local_json(data_path):
                     yield json.loads(line)
 
 
+# 筛选指定后缀的仓库文件，若 data/ 下有匹配则优先使用那一组并稳定排序。
 def _list_hub_data_files(data_path: str, suffixes: tuple[str, ...]) -> list[str]:
     """List repo files matching ``suffixes``, preferring those under ``data/``."""
     files = list_repo_files(data_path, repo_type="dataset")
@@ -454,6 +488,7 @@ def _list_hub_data_files(data_path: str, suffixes: tuple[str, ...]) -> list[str]
     return preferred or matching
 
 
+# 直接下载 JSON 文件并用标准库解析，绕过混合类型列导致的 Arrow schema 推断问题。
 def _load_hub_json_files(data_path):
     """Download JSON/JSONL files from a HF Hub dataset and yield rows.
 
@@ -469,6 +504,7 @@ def _load_hub_json_files(data_path):
         yield from load_local_json(local_path)
 
 
+# 绕过数据集卡片配置，直接用 Parquet 文件 URL 建流式数据集。
 def _load_hub_parquet_dataset(data_path: str):
     """Stream parquet files from a HF Hub dataset.
 
@@ -482,6 +518,8 @@ def _load_hub_parquet_dataset(data_path: str):
     return load_dataset("parquet", data_files=urls, split="train", streaming=True)
 
 
+# 本地文件/目录按格式读取，Hub 优先原生 streaming，schema 错误时尝试原始分片。
+# 预分词语料保留全部列以免丢掉 ID/mask 和溯源信息；普通 Hub 对话仅保留约定的输入列。
 def load_hf_dataset(data_path: str):
     """Load dataset as a streaming IterableDataset.
 

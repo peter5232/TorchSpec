@@ -18,22 +18,27 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# EAGLE3 的编译损失内核：先筛有效行，再做 RMSNorm/head 与分布比较，返回求和量供外层归一化。
+# forward_kl 实现是教师软标签交叉熵（比 KL 多教师熵常数）；LK 分支另外统计分布重合质量 alpha。
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
 
+# float32 中算 logsumexp(z)-sum(p*z)，即 -sum(p log q)，不显式存 log_softmax 张量。
 def _forward_kl_from_logits(logits: torch.Tensor, target_p: torch.Tensor) -> torch.Tensor:
     logits_f32 = logits.float()
     return torch.logsumexp(logits_f32, dim=-1) - (target_p * logits_f32).sum(-1)
 
 
+# 先转 float32，用 exp(z-logsumexp(z)) 求概率，稳定处理大 logits 并避免低精度归一化误差。
 def _softmax_from_logits(logits: torch.Tensor) -> torch.Tensor:
     logits_f32 = logits.float()
     return torch.exp(logits_f32 - torch.logsumexp(logits_f32, dim=-1, keepdim=True))
 
 
+# dense 头一次线性得到 V 维；low-rank 头先到 rank 再经 up 到 V，不显式构建稠密权重。
 def _project(
     hidden: torch.Tensor,
     lm_head_weight: torch.Tensor,
@@ -46,6 +51,7 @@ def _project(
     return logits
 
 
+# 对隐藏态最后维 float32 求均方，回原 dtype 后乘 gamma，再执行输出投影；与 draft final norm 对齐。
 def _rmsnorm_logits(
     hs_flat: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -60,6 +66,7 @@ def _rmsnorm_logits(
     return _project(norm_hs, lm_head_weight, lm_head_up)
 
 
+# 编译区域内 gather valid_idx，只对 N 个有效 [H] 行归一化/投影，返回 soft CE 总和、argmax 正确数和 N。
 @torch.compile(dynamic=None)
 def compiled_sum_forward_kl_loss(
     prenorm_hidden_states_flat,
@@ -85,6 +92,8 @@ def compiled_sum_forward_kl_loss(
     return token_loss.sum(), correct.sum(), count
 
 
+# 融合有效行 gather、RMSNorm、LM head 和 soft CE，避免在编译边界外额外物化 [N,V] 副本。
+# correct 比较教师分布 argmax 而非数据 token；count 是有效行数，不是原始 B*T。
 @torch.compile(dynamic=None)
 def compiled_forward_kl_loss(
     prenorm_hidden_states_flat,
@@ -125,6 +134,8 @@ def compiled_forward_kl_loss(
     return token_loss.sum(), correct.sum(), count
 
 
+# 恢复真实子词表质量 p=tp_tilde*coverage，再算 alpha=sum(min(p,q)) 与 -log(alpha)。
+# 例如子词表覆盖 0.7，即使 q 完全匹配重归一化教师，alpha 也不应被虚增到 1。
 @torch.compile(dynamic=None)
 def compiled_lk_alpha_loss(
     prenorm_hidden_states_flat,
@@ -164,6 +175,8 @@ def compiled_lk_alpha_loss(
     return token_loss.sum(), correct.sum(), count, alpha.sum()
 
 
+# 每次调用用平均 alpha 的 detach 值生成 lambda=exp(-eta*alpha)，混合 KL 和 TV。
+# KL 用归一化子词表 tp_tilde，alpha/TV 用 coverage 还原的 p；USP 可传全组平均值避免分片各自调度。
 @torch.compile(dynamic=None)
 def compiled_lk_lambda_loss(
     prenorm_hidden_states_flat,
@@ -210,6 +223,8 @@ def compiled_lk_lambda_loss(
     lam = torch.exp(-eta * mean_alpha.detach())
 
     kl = F.kl_div(log_q, tp_tilde, reduction="none").sum(-1)
+    # 裁剪路径这里仅计算子词表上的绝对差；完整词表 TV 还含子词表外固定质量的一半。
+    # 这部分对 draft 参数是常数，当前实现不加它，因此不能把该 tv 标量直接当完整分布 TV。
     tv = 0.5 * (tp - q).abs().sum(-1)
     token_loss = lam * kl + (1.0 - lam) * tv
 
@@ -218,6 +233,7 @@ def compiled_lk_lambda_loss(
     return token_loss.sum(), correct.sum(), count, alpha.sum()
 
 
+# LazyTarget 路径只对有效教师行做 head+softmax，再计算 draft soft CE，返回可跨 SP 相加的 sum/count。
 @torch.compile(dynamic=None)
 def compiled_sum_forward_kl_loss_from_hs(
     prenorm_hidden_states_flat,
@@ -247,6 +263,7 @@ def compiled_sum_forward_kl_loss_from_hs(
     return token_loss.sum(), correct.sum(), count
 
 
+# 由有效教师 hidden 延迟构造完整词表概率，直接与 q 求重合质量，完整词表不需要 coverage 修正。
 @torch.compile(dynamic=None)
 def compiled_lk_alpha_loss_from_hs(
     prenorm_hidden_states_flat,
@@ -275,6 +292,7 @@ def compiled_lk_alpha_loss_from_hs(
     return token_loss.sum(), correct.sum(), count, alpha.sum()
 
 
+# 完整词表 LazyTarget 的 KL/TV 混合；lambda 是整个深度的标量，不是每 token 自适应权重。
 @torch.compile(dynamic=None)
 def compiled_lk_lambda_loss_from_hs(
     prenorm_hidden_states_flat,
@@ -317,6 +335,8 @@ def compiled_lk_lambda_loss_from_hs(
     return token_loss.sum(), correct.sum(), count, alpha.sum()
 
 
+# 先 gather 教师/草稿隐藏态再生成两边 logits，避免完整 [B*T,V] 常驻。
+# 教师 hidden 的冻结由调用链保证，本函数本身不 detach 任意输入；只在冻结教师数据上调用。
 @torch.compile(dynamic=None)
 def compiled_forward_kl_loss_from_hs(
     prenorm_hidden_states_flat,

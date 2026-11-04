@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# 下载 PerfectBlend 数据集，统一对话字段并过滤后输出 TorchSpec JSONL。
+# 这是数据准备程序：会访问 Hub 并覆盖输出文件；抽样发生在过滤之前，最终条数不一定等于 sample-size。
+
 """Prepare PerfectBlend dataset for DFlash training.
 
 Downloads mlabonne/open-perfectblend from HuggingFace, normalizes to
@@ -27,6 +30,7 @@ ROLE_MAPPING = {
 }
 
 
+# 接受 role/content 或 from/value 消息，后者映射角色名称；任一消息不符合这两种格式就丢弃整段对话。
 def normalize_conversation(conv_list):
     """Normalize ShareGPT format to standard role/content format."""
     result = []
@@ -41,6 +45,7 @@ def normalize_conversation(conv_list):
     return result
 
 
+# 至少两条消息且包含 assistant，assistant 内容总字符数至少 50；这是字符启发式，不是 tokenizer 计算的 token 保证。
 def is_valid_conversation(conv):
     """Check conversation has valid structure for training."""
     if not conv or len(conv) < 2:
@@ -55,6 +60,7 @@ def is_valid_conversation(conv):
     return True
 
 
+# 固定随机种子后下载 train split，先抽样再规范化和过滤，逐行覆盖写出 UTF-8 JSON，并报告保留/跳过数量。
 def main():
     parser = argparse.ArgumentParser(description="Prepare PerfectBlend for DFlash training")
     parser.add_argument("--output", type=str, required=True, help="Output JSONL path")
@@ -71,6 +77,7 @@ def main():
     ds = load_dataset("mlabonne/open-perfectblend")["train"]
     print(f"Loaded {len(ds)} samples")
 
+    # 先抽样后过滤：请求 50000 条候选，若一部分对话不合法，最终输出会少于 50000。
     if args.sample_size and args.sample_size < len(ds):
         indices = random.sample(range(len(ds)), args.sample_size)
         ds = ds.select(indices)
@@ -80,6 +87,7 @@ def main():
 
     valid = 0
     skipped = 0
+    # 写模式会替换同路径原文件；这不是增量追加或带断点的下载任务。
     with open(args.output, "w") as f:
         for idx, row in enumerate(tqdm(ds, desc="Processing")):
             conv = row.get("conversations", row.get("conversation", []))
@@ -87,6 +95,7 @@ def main():
             if normalized is None or not is_valid_conversation(normalized):
                 skipped += 1
                 continue
+            # 基础有效性与用户 min-turns 两层过滤；turn 在此按消息条数计，不是 user/assistant 成对轮数。
             if len(normalized) < args.min_turns:
                 skipped += 1
                 continue

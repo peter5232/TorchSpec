@@ -18,6 +18,9 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+# 将外部 draft 权重转为 TorchSpec 的 DCP warm-start 目录；不恢复原优化器和训练步历史。
+# 输入若不是现有路径会尝试 Hugging Face 下载；运行会创建单进程 gloo 组并写出检查点。
+
 
 """
 Build a warm-start init checkpoint for a TorchSpec draft model from an external
@@ -60,6 +63,7 @@ from torchspec.models.draft.keymap import DRAFT_WEIGHT_KEY_REMAP  # noqa: E402
 from torchspec.training.checkpoint import ModelState  # noqa: E402
 
 
+# 按 DCP 元数据先分配完整 CPU 张量，再用 no_dist 模式读取分片，不需要原训练的多 GPU 拓扑。
 def _load_dcp_flat(model_dir: str) -> dict:
     sd: dict = {}
     dcp.state_dict_loader._load_state_dict(
@@ -71,6 +75,7 @@ def _load_dcp_flat(model_dir: str) -> dict:
     return sd
 
 
+# 存在的本地路径直接使用，否则视作 Hub 仓库 ID 下载 safetensors 和 JSON；路径拼错也可能触发网络解析。
 def _resolve_input(input_path: str) -> str:
     """Return a local path for input_path, downloading it from the Hugging Face Hub
     if it is a repo id rather than an existing local path."""
@@ -82,6 +87,7 @@ def _resolve_input(input_path: str) -> str:
     return snapshot_download(repo_id=input_path, allow_patterns=["*.safetensors", "*.json"])
 
 
+# 支持单文件、标准 model.safetensors 和带索引的分片目录；每个唯一 shard 只读一次再合并权重字典。
 def _load_safetensors(path: str):
     """Load a single-file or sharded (index.json) safetensors checkpoint. Returns
     (state_dict, source) or None if no safetensors are found at path."""
@@ -106,6 +112,7 @@ def _load_safetensors(path: str):
     return None
 
 
+# 依次识别当前/子目录 DCP、tracker 指向的最新迭代、safetensors；返回权重和来源描述供诊断。
 def _load_flat(input_path: str):
     """Return (flat_state_dict, source_description). Accepts a HF Hub repo id, a
     local HF / safetensors dir or file, or a TorchSpec torch-DCP dir."""
@@ -129,6 +136,8 @@ def _load_flat(input_path: str):
     )
 
 
+# 剥离 draft_model 包装前缀，跳过词表映射，只在别名落到真实模型键时替换名称。
+# 不转置或重排权重数值；名字匹配之后的 shape 兼容性仍由 load_state_dict 检查。
 def _remap_to_model(raw: dict, model_keys: set) -> dict:
     """Strip any wrapper/draft prefix and remap sglang export names toward the
     target model's keys, applying an alias only when it lands on a real model key
@@ -141,6 +150,7 @@ def _remap_to_model(raw: dict, model_keys: set) -> dict:
         if dk in ("t2d", "d2t"):  # vocab-pruning maps, not weights
             continue
         target = dk
+        # 已有合法键优先，例如某架构本就拥有 layers.0，不能机械逆映射成 midlayer。
         if target not in model_keys:
             for internal_prefix, export_prefix in DRAFT_WEIGHT_KEY_REMAP:
                 if dk.startswith(export_prefix):
@@ -152,6 +162,7 @@ def _remap_to_model(raw: dict, model_keys: set) -> dict:
     return out
 
 
+# 按目标配置实例化 draft，把可匹配权重按指定精度载入；匹配少于一半拒绝输出，再写迭代 1 的 DCP 与 tracker。
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -172,6 +183,7 @@ def main():
     os.environ.setdefault("MASTER_PORT", "29655")
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
+    # 虽然只有 CPU 单进程，保存 ModelState 的 DCP 接口仍在这里初始化 gloo；运行会绑定本地通信端口。
     dist.init_process_group("gloo", rank=0, world_size=1)
 
     cfg = AutoDraftModelConfig.from_file(args.config)
@@ -181,6 +193,8 @@ def main():
     raw, src = _load_flat(args.input)
     remapped = _remap_to_model(raw, model_keys)
     matched = {k: v.to(dtype) for k, v in remapped.items() if k in model_keys}
+    # strict=False 允许缺键并保留模型随机初值，但同名张量 shape 不兼容仍可报错。
+    # 匹配计数按键数而非参数量，一个巨大权重缺失也不能仅凭匹配百分比判断安全。
     result = model.load_state_dict(matched, strict=False)
 
     ignored = sorted(set(remapped) - model_keys)
@@ -190,6 +204,7 @@ def main():
     if ignored:
         print(f"ignored source keys ({len(ignored)}): {ignored}")
 
+    # 在写盘前拦截明显映射失败；通过一半阈值不代表每个权重都已来自外部 checkpoint。
     if len(matched) == 0:
         raise SystemExit(
             "ERROR: no source key matched the target model — check formats / key names."
@@ -200,11 +215,14 @@ def main():
             "failure; refusing to write a half-initialized init."
         )
 
+    # 只给模型加上 draft_model 子模块层级，使保存键空间与训练侧 ModelState 期望一致。
     class Wrapper(nn.Module):
+        # 注册 draft 为真实 nn.Module 子模块，state_dict 因此自动带 draft_model 前缀。
         def __init__(self, draft_model):
             super().__init__()
             self.draft_model = draft_model
 
+    # 输出只含初始化模型与迭代 tracker，没有原优化器动量或随机数状态，因此用于 warm-start 而非精确续训。
     model_dir = os.path.join(args.output, "iter_0000001", "model")
     os.makedirs(model_dir, exist_ok=True)
     dcp.save({"model_state": ModelState(Wrapper(model))}, checkpoint_id=model_dir)

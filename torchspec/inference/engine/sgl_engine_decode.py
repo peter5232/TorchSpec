@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 在 SGLang 上生成真实 completion 再提取训练样本，同时提供已训练 draft 权重的热更新入口。
+# 这里的在线 speculative decoding 接受率，与训练模型内部的多步展开 loss 是不同概念。
+
 """
 Decode-mode mixin for SglEngine.
 
@@ -36,6 +39,7 @@ from torchspec.data.utils import serialize_packed_loss_mask
 from torchspec.utils.logging import logger
 
 
+# 依赖宿主引擎提供模型实例、形状转换和多模态处理，本类只补充 decode 请求及权重同步。
 class SglDecodeEngineMixin:
     """Mixin that adds decode-mode generation and weight sync to SglEngine.
 
@@ -58,6 +62,7 @@ class SglDecodeEngineMixin:
         ("sglang_speculative_draft_attention_backend", "speculative_draft_attention_backend"),
     ]
 
+    # 把可选并发限制写入引擎参数；启用 speculative algorithm 时还必须有 draft 路径并明确禁用其量化。
     def _build_decode_engine_kwargs(self, engine_kwargs: dict) -> None:
         """Populate *engine_kwargs* with decode-mode speculative decoding params."""
         for attr, kwarg in self._DECODE_OPTIONAL_KWARGS:
@@ -90,6 +95,7 @@ class SglDecodeEngineMixin:
 
     # -- Generation -----------------------------------------------------------
 
+    # token 输入直接数元素；文本尽力调用后端 tokenizer，失败则返回 None 交给后端真正分词。
     def _decode_prompt_token_lengths(
         self,
         *,
@@ -127,6 +133,8 @@ class SglDecodeEngineMixin:
                 lengths.append(None)
         return lengths
 
+    # 按采样配置生成新 token，先过滤无法容纳最短 completion 的输入，再以原批次位置回填结果。
+    # 无存储键、过短 completion 或首 token 即停止符时保留 None；这样编排层仍能将输出与输入一一对应。
     def generate_with_decode(
         self,
         data_id: str | list[str],
@@ -194,6 +202,7 @@ class SglDecodeEngineMixin:
                 f"decode.min_new_tokens ({min_new_tokens}) cannot exceed "
                 f"decode.max_new_tokens ({max_new_tokens})"
             )
+        # 采样上限控制生成开销，下限减少零有效监督样本；后续 temperature/top-p/top-k 仅在需要时显式传入。
         sampling_params = {
             "max_new_tokens": max_new_tokens,
             "min_new_tokens": min_new_tokens,
@@ -213,6 +222,8 @@ class SglDecodeEngineMixin:
             sampling_params["top_k"] = top_k
         logger.debug(f"SglEngine rank {self.rank}: decode sampling_params={sampling_params}")
 
+        # 过滤不能改变批次对齐：例如输入 [甲, 乙, 丙] 只执行甲和丙，
+        # 最终仍须返回 [甲结果, None, 丙结果]，否则后面的标签会配到错误样本。
         outputs: list[dict[str, Any] | None] = [None for _ in range(batch_size)]
         active_indices = list(range(batch_size))
         max_seq_length = getattr(self.args, "max_seq_length", None)
@@ -237,6 +248,7 @@ class SglDecodeEngineMixin:
             return outputs
 
         active_data_ids = [data_ids[i] for i in active_indices]
+        # 所有附属输入都按同一 active_indices 过滤，确保图像、ID 和 token 不会因剔除样本错位。
         active_multimodal_inputs = (
             [multimodal_inputs[i] for i in active_indices]
             if multimodal_inputs is not None
@@ -286,6 +298,7 @@ class SglDecodeEngineMixin:
         if image_data is not None:
             engine_kwargs["image_data"] = image_data
 
+        # 只有这一调用真正产生 completion；前面的工作只是请求规范化和容量预检查。
         results = self._engine.generate(**engine_kwargs)
         if len(results) != len(active_indices):
             raise RuntimeError(
@@ -321,6 +334,7 @@ class SglDecodeEngineMixin:
             prompt_tokens = meta_info.get("prompt_tokens", 0)
             completion_tokens = meta_info.get("completion_tokens", 0)
             output_ids = result.get("output_ids", [])
+            # 虽然已拿到存储键，但这种 completion 无法形成有效 completion loss，不能直接进入训练队列。
             if completion_tokens <= 1:
                 text = result.get("text", "")
                 logger.warning(
@@ -338,6 +352,9 @@ class SglDecodeEngineMixin:
                 )
                 continue
 
+            # 例如 prompt 有 4 个 token、completion 有 3 个，则可存训练长度为 6。
+            # 最后生成 token 尚无后续目标；对应 mask 的段长为 [4, 2]，只让 completion 的有效位置参与 loss。
+            # 这里处理数据长度；draft 多步训练中的进一步位置平移仍由训练模型负责。
             seq_len = prompt_tokens + completion_tokens - 1
             logger.debug(
                 f"SglEngine rank {self.rank}: decode mode - "
@@ -358,6 +375,7 @@ class SglDecodeEngineMixin:
             else:
                 loss_mask = serialize_packed_loss_mask([prompt_tokens])
 
+            # 这里只构造控制面元数据；hidden_states 实体已由后端保存，训练进程稍后按键读取。
             output_dict = {
                 "mooncake_key": key,
                 "tensor_shapes": tensor_shapes,
@@ -375,6 +393,7 @@ class SglDecodeEngineMixin:
                 "prompt_tokens",
                 "completion_tokens",
             )
+            # 附带接受率等指标用于观察在线推理性能，它们不是 loss mask 或 teacher 概率分布。
             output_dict.update({k: meta_info[k] for k in _METRIC_KEYS if k in meta_info})
 
             outputs[i] = output_dict
@@ -388,6 +407,7 @@ class SglDecodeEngineMixin:
 
     # -- Weight sync ----------------------------------------------------------
 
+    # 构造只更新 draft 的磁盘权重请求并清缓存，通过内部事件循环执行；不会重启整个 teacher 引擎。
     def update_weights_from_disk(self, model_path: str) -> dict:
         """Update draft model weights from disk without restarting the engine.
 

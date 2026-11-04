@@ -18,11 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：renderer 比字符串模板拥有更多职责：同时负责消息编码和监督范围。
+# Protocol 定义结构契约，不要求所有实现显式继承；训练入口通过注册名称实例化。
+
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
 DEFAULT_CACHE_VERSION = "v1"
 
 
+# 支持复杂/嵌套模型协议的接口；输入规范消息，输出等长的 ID 和二值监督列表。
 @runtime_checkable
 class ConversationRenderer(Protocol):
     """Turn normalized chat messages into training tokens and supervision.
@@ -40,8 +44,10 @@ class ConversationRenderer(Protocol):
     # stale caches are not silently reused.
     CACHE_VERSION: ClassVar[str] = DEFAULT_CACHE_VERSION
 
+    # 接口约定接收目标 tokenizer，确保训练格式与目标模型的 token 编码相符。
     def __init__(self, tokenizer: Any) -> None: ...
 
+    # 提供训练时动态重建 mask 的 header、end 和额外跳过长度，适用于媒体占位展开后的实际 token 流。
     def get_assistant_token_ids(self) -> tuple[list[int], list[int], int]:
         """Return ``(header_ids, end_ids, skip_after_header)`` for dynamic masks.
 
@@ -51,6 +57,8 @@ class ConversationRenderer(Protocol):
         ``end_ids`` must match the token that closes an assistant turn.
         """
 
+    # 实现必须同步截断 ID/mask 到 max_seq_length，并按 last_turn_only 决定监督轮次。
+    # generation_config 是样本级格式化选项，影响思考等提示结构，不一定代表此处执行采样。
     def render(
         self,
         messages: list[dict[str, Any]],

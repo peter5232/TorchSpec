@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 训练端只加载冻结教师 LM head，以及输入为 pre-norm 时需要的 final norm，避免复制整台教师模型。
+# 分布式加载先达成全 rank 成功/失败共识，再广播同构参数；缺 norm 属于正确性错误。
 import glob
 import json
 import logging
@@ -37,11 +39,13 @@ logger = logging.getLogger(__name__)
 class _TargetRMSNorm(nn.Module):
     """Weight-only RMSNorm used when remote model construction is unavailable."""
 
+    # 为无法从完整架构提取 norm 的教师建立等价 weight-only RMSNorm，eps 来自教师配置。
     def __init__(self, hidden_size: int, eps: float):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    # float32 求均方并归一化，回输入 dtype 后乘缩放权重，保持教师 RMSNorm 的运算顺序。
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.float()
@@ -61,6 +65,7 @@ class TargetLMHead(nn.Module):
     warning, since silently skipping it trains against the wrong targets.
     """
 
+    # 保留完整多模态配置用于架构重建，另取 text_config 决定 H/V，并初始化可选 norm=None。
     def __init__(self, config):
         super().__init__()
         # Both configs are kept: ``model_config`` is what ``AutoModelForCausalLM``
@@ -72,6 +77,7 @@ class TargetLMHead(nn.Module):
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.norm: nn.Module | None = None
 
+    # 解析配置、定位本地/Hub 权重，加载 head 和按需 norm，再转设备/dtype、eval 并冻结全部参数。
     @classmethod
     def from_pretrained(
         cls,
@@ -107,6 +113,7 @@ class TargetLMHead(nn.Module):
 
         return instance
 
+    # 优先从索引定位指定 head key 的分片，无索引则选单文件；缺键/文件直接报错。
     def _load_lm_head(self, model_path: str, lm_head_key: str):
         index_files = glob.glob(os.path.join(model_path, "*.index.json"))
 
@@ -131,6 +138,7 @@ class TargetLMHead(nn.Module):
             else:
                 raise FileNotFoundError(f"No checkpoint file found in {model_path}")
 
+    # 读取 safetensors 单张量或 bin 字典中的 key，copy 到 head 参数；不允许保留随机初始化头继续训练。
     def _load_key_from_file(self, file_path: str, key: str):
         tensor = None
         if file_path.endswith(".safetensors"):
@@ -148,6 +156,7 @@ class TargetLMHead(nn.Module):
         else:
             raise KeyError(f"Key {key} not found in {file_path}")
 
+    # 非 rank0 构建与加载 rank 相同的 norm 参数结构，分配 CPU 空存储后填 1，等待广播真正权重。
     def _init_norm_structure(self) -> None:
         """Create the norm module structure (no weights loaded).
 
@@ -165,6 +174,7 @@ class TargetLMHead(nn.Module):
         self.norm = norm_module.to_empty(device="cpu")
         torch.nn.init.ones_(self.norm.weight)
 
+    # 创建真实 norm 模块并载入指定权重；任何失败都清空 norm 后抛错，避免对 pre-norm 状态直接投影。
     def _init_and_load_norm(self, model_path: str, norm_key: str) -> None:
         """Create the final norm module and load its checkpoint weight.
 
@@ -189,6 +199,7 @@ class TargetLMHead(nn.Module):
                 f"Failed to load verifier norm key {norm_key!r} from {model_path!r}"
             ) from e
 
+    # 优先从完整模型架构提取 norm，失败时仅在配置含 hidden_size/rms_norm_eps 时构造 RMSNorm 替代。
     def _create_norm_module(self) -> "nn.Module | None":
         """Create the model final norm, with a config-driven RMSNorm fallback.
 
@@ -199,6 +210,7 @@ class TargetLMHead(nn.Module):
         dropping normalisation entirely.
         """
         architecture_error = None
+        # 优先使用模型原生 norm 类型，meta 构造失败时记录异常供 fallback 日志或最终错误使用。
         try:
             norm_module = self._extract_norm_from_architecture()
         except Exception as exc:
@@ -210,7 +222,9 @@ class TargetLMHead(nn.Module):
 
         hidden_size = getattr(self.config, "hidden_size", None)
         rms_norm_eps = getattr(self.config, "rms_norm_eps", None)
+        # 只有配置给出 RMSNorm 所需关键信息时才可重建，不能对未知归一化结构随意假设。
         if hidden_size is not None and rms_norm_eps is not None:
+            # 没有合法 fallback 时传播架构构造失败原因；静默不做 norm 会训练错误教师分布。
             if architecture_error is not None:
                 logger.warning(
                     "Final-norm architecture extraction failed; using a "
@@ -228,6 +242,7 @@ class TargetLMHead(nn.Module):
 
         return None
 
+    # 在 meta 设备只建立结构，逐层解开 model/language_model 包装并寻找 norm，不分配完整模型权重。
     def _extract_norm_from_architecture(self) -> "nn.Module | None":
         """Instantiate the model on meta device and return the final norm module."""
         from transformers import AutoModelForCausalLM
@@ -251,6 +266,7 @@ class TargetLMHead(nn.Module):
         del skeleton
         return norm_module
 
+    # 按索引或单文件定位任意 norm 参数 key，并 copy 到目标 Parameter；读取与赋值分离可复用到不同 norm。
     def _load_key_into(self, model_path: str, key: str, param: torch.nn.Parameter) -> None:
         """Load a single key from safetensors/bin files into a parameter."""
         index_files = glob.glob(os.path.join(model_path, "*.index.json"))
@@ -285,11 +301,14 @@ class TargetLMHead(nn.Module):
         else:
             raise KeyError(f"Key {key} not found in {file_path}")
 
+    # 这里只执行 lm_head(hidden_states)，不会自动调用 self.norm；pre-norm 输入的归一化由训练调用方显式负责。
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Compute logits from hidden states."""
         return self.lm_head(hidden_states)
 
 
+# rank0 读取检查点，其余 rank 建同样 head/norm；先 all_reduce(MIN) 确认每个 rank 初始化成功。
+# 只在全体成功后逐参数 broadcast，避免一个 rank 抛错、其他 rank 永久等权重；最终各 rank 均为冻结教师头。
 def load_synced_target_lm_head(
     model_path: str,
     *,
@@ -312,6 +331,7 @@ def load_synced_target_lm_head(
     head: Optional[TargetLMHead] = None
     local_error: Optional[Exception] = None
     try:
+        # 只让一个 rank 读大词表权重，减少共享存储压力；其他 rank 只读配置并分配目标结构。
         if rank == 0:
             head = TargetLMHead.from_pretrained(
                 model_path=model_path,
@@ -331,6 +351,7 @@ def load_synced_target_lm_head(
             head.eval()
             head.requires_grad_(False)
 
+        # 所有 rank 必须对是否包含 norm 达成相同结构；少一个参数就会使后续广播循环失配。
         if load_norm and head.norm is None:
             raise RuntimeError(
                 "last_hidden_states_prenorm=True requires a loaded verifier norm, "
@@ -342,6 +363,7 @@ def load_synced_target_lm_head(
     # Raising straight out of the block above would strand the other ranks in the
     # parameter broadcast below until the process-group timeout, so agree on failure
     # first and let every rank report it.
+    # 此 collective 必须由失败与成功的 rank 都参加；本地异常先保存在变量中，不能提前 raise 跳出。
     initialized = torch.tensor([local_error is None], dtype=torch.int32, device=device)
     dist.all_reduce(initialized, op=dist.ReduceOp.MIN)
     if not initialized.item():
@@ -352,6 +374,7 @@ def load_synced_target_lm_head(
             "see that rank's traceback for the root cause"
         )
 
+    # 此时已确认初始化全体成功，同一参数顺序逐项广播，从而复用 rank0 实际加载的冻结数值。
     for param in head.parameters():
         dist.broadcast(param.data, src=0)
 

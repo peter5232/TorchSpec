@@ -20,6 +20,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 中文导读：对话规范化、监督区间构建和草稿词表选择。
+# 这里也保留旧版 .ckpt 离线读取器，它与 offline/dataset.py 的 manifest 回放格式不是同一个协议。
+# 词表裁剪只缩小草稿输出空间；目标模型与 tokenizer 的 token ID 语义仍需保持一致。
+
 import os
 import warnings
 from collections import Counter
@@ -62,6 +66,8 @@ ROLE_MAPPING = {
 _REASONING_FIELDS = ("thinking", "thinking_content", "reasoning_content", "reasoning")
 
 
+# 把 ShareGPT 的 from/value 改成 role/content，并保留工具字段，将多种思考字段归一。
+# 已有标准格式直接返回；不要假设这个函数总会深拷贝消息，调用方后续就地修改可能影响原列表。
 def _normalize_conversation(conversation: Conversation) -> Conversation:
     """
     Normalize conversation format to use role/content keys.
@@ -96,6 +102,8 @@ def _normalize_conversation(conversation: Conversation) -> Conversation:
 
 
 # Copied from https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py
+# 逐对话先格式化再编码成 ID 和监督 mask，过滤没有足够监督位置的样本。
+# 每个保留样本增加一个 batch 维 [1,T]；attention_mask 标上下文，loss_mask 只标训练目标。
 def preprocess_conversations(
     tokenizer: PreTrainedTokenizer,
     conversations: Union[List[Conversation], List[str]],
@@ -189,6 +197,8 @@ def preprocess_conversations(
     return results
 
 
+# 旧式 HF Dataset.map 批处理入口，检查模板、可选打乱、映射并设置 torch 输出格式。
+# 它与 controller 使用的 load_conversation_dataset 返回类型不同：这里返回 HF Dataset，而非条目列表。
 def build_eagle3_dataset(
     dataset: HFDataset,
     tokenizer: PreTrainedTokenizer,
@@ -242,6 +252,7 @@ def build_eagle3_dataset(
         dataset = dataset.shuffle(seed=shuffle_seed)
     original_cols = dataset.column_names
 
+    # 按是否已经格式化选择 text 或 conversations 列；额外列转成逐样本 kwargs 传给预处理。
     def preprocess_function(examples):
         if is_preformatted:
             if "text" not in examples:
@@ -308,6 +319,7 @@ def build_eagle3_dataset(
 # Offline Eagle3 Dataset
 # ==============================
 # modified from https://github.com/NickL77/BaldEagle/blob/master/train/modules/data/data.py
+# 递归收集给定后缀文件，默认 .ckpt；当前不排序，调用者不能依赖文件系统遍历顺序复现实验。
 def list_local_files(path, suffixes=None):
     if suffixes is None:
         suffixes = [".ckpt"]
@@ -320,13 +332,17 @@ def list_local_files(path, suffixes=None):
     return datapaths
 
 
+# 旧版 Eagle3 checkpoint 特征数据集，提供 PyTorch map-style Dataset 接口。
 class OfflineEagle3Dataset(torch.utils.data.Dataset):
+    # 保存文件列表、可选样本变换和最大序列长度；构造时不一次加载所有特征。
     def __init__(self, datapath, transform=None, max_len=2048):
         self.datapaths = datapath
         self.transform = transform
         self._epoch = 0
         self.max_len = max_len
 
+    # 读取旧字段 aux_hidden_states/hidden_states，截长并左移 input_ids 与 target，实现下一 token 对齐。
+    # 末位 loss_mask 置零，因为移位后的末尾是补零项而没有真实未来目标；该逻辑属于旧格式约定。
     @staticmethod
     def process_data(data, max_len, transform=None):
         new_data = {}
@@ -347,12 +363,15 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
             new_data = transform(new_data)
         return new_data
 
+    # 返回文件列表长度，每个文件视作一个样本。
     def __len__(self):
         return len(self.datapaths)
 
+    # 按索引 torch.load 旧特征文件；该旧接口使用 weights_only=False。
     def _open_file(self, index):
         return torch.load(self.datapaths[index], weights_only=False)
 
+    # 读样本失败时记录错误并退回第一个文件，再执行形状转换；因此读错不会自动减少数据集长度。
     def __getitem__(self, index):
         try:
             data = self._open_file(index)
@@ -361,10 +380,12 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
             data = self._open_file(0)
         return self.process_data(data, self.max_len, self.transform)
 
+    # 只记录 epoch 值；此类本身不会据此自动打乱文件列表。
     def set_epoch(self, epoch):
         self._epoch = epoch
 
 
+# 扫描旧 .ckpt 文件并构造旧数据集，不读取新版 manifest 或 dataset.json。
 def build_offline_eagle3_dataset(
     hidden_states_path: str,
     max_len: int = 2048,
@@ -375,9 +396,12 @@ def build_offline_eagle3_dataset(
     )
 
 
+# 合并所有 ID 和监督 mask，仅统计 mask=1 的目标 token 频率。
+# 选择输出词表应反映助手回答而非全部提示词；没有 packed mask 的条目按全监督统计。
 def _count_token_frequencies(prompts: list) -> Counter:
     """Count token frequencies from tokenized prompts using packed_loss_mask."""
 
+    # Numba 编译的紧凑计数循环：只在监督位置增加对应 ID 的桶，避免逐 token Python 对象操作。
     @numba.njit(cache=True)
     def _histogram(ids, mask, counts):
         for i in range(len(ids)):
@@ -414,6 +438,7 @@ def _count_token_frequencies(prompts: list) -> Counter:
     return Counter(dict(zip(nonzero.tolist(), counts[nonzero].tolist())))
 
 
+# 从已 tokenized 的条目统计频率，再选草稿词表并返回两个编码缓冲。
 def generate_vocab_mapping(
     prompts: list,
     target_vocab_size: int,
@@ -440,6 +465,10 @@ def generate_vocab_mapping(
     )
 
 
+# 选最高频 token 后按目标 ID 排序；不足草稿词表大小时用零频 token 补齐。
+# 注意实际编码与旧 docstring 的字面描述不同：t2d 是全词表布尔选择掩码，d2t 是 ID 差值。
+# 例如选中目标 ID [2,5,9]：d2t=[2,4,7]，草稿列 j 对应的目标 ID 为 j+d2t[j]；
+# t2d 在 2、5、9 位置为 True，不能当作 target ID→draft ID 的整数查表。
 def process_token_dict_to_mappings(
     token_dict: Counter,
     draft_vocab_size: int,
@@ -487,6 +516,8 @@ def process_token_dict_to_mappings(
     used_tokens = sorted(key for key, freq in top_N if key < target_vocab_size)
     used_arr = torch.tensor(used_tokens, dtype=torch.long)
 
+    # 这里保存差值是为了与草稿输出列索引相加后恢复目标 ID，不是直接保存目标 ID。
+    # 如果拿 d2t[j] 直接当 tokenizer ID，除第零列外都会产生错映射；配套使用方必须遵守编码。
     d2t = used_arr - torch.arange(len(used_arr))
     t2d = torch.zeros(target_vocab_size, dtype=torch.bool)
     t2d[used_arr] = True

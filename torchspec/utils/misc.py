@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 运行环境辅助：节点地址、端口探测、GPU 可见性映射及默认 teacher 辅助层选择。
+
 import os
 import socket
 from typing import List
@@ -26,6 +28,7 @@ import ray
 from transformers import AutoConfig
 
 
+# 调用 Ray 的当前节点地址解析，并去掉 IPv6 地址的方括号后返回字符串。
 def get_current_node_ip():
     address = ray._private.services.get_node_ip_address()
     # strip ipv6 address
@@ -33,6 +36,7 @@ def get_current_node_ip():
     return address
 
 
+# 尝试 bind/listen 检查 IPv4 TCP 端口，离开 with 即关闭 socket；不负责长期预留端口。
 def _is_port_available(port):
     """Return whether a port is available."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -47,6 +51,7 @@ def _is_port_available(port):
             return False
 
 
+# 从起点线性扫描，寻找 consecutive 个连续可绑定端口；探测后仍可能被其他进程抢占。
 def get_free_port(start_port=10000, consecutive=1):
     # find the port where port, port + 1, port + 2, ... port + consecutive - 1 are all available
     port = start_port
@@ -55,6 +60,8 @@ def get_free_port(start_port=10000, consecutive=1):
     return port
 
 
+# 将物理 GPU 编号按 CUDA_VISIBLE_DEVICES 映射成进程局部索引，也接受已局部化编号。
+# 例如可见列表 4,5,6,7 中物理 6 映射为 2；不在任一合法范围则报错。
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     if not cvd:
@@ -73,6 +80,7 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
+# 读取 teacher 配置的文本层数 L，返回 [1,L//2-1,L-4] 三个默认辅助层索引。
 def get_default_eagle3_aux_layer_ids(model_path: str) -> List[int]:
     """Get default auxiliary hidden state layer IDs for EAGLE3.
 

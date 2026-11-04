@@ -18,11 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 按 token 序列中的 assistant header/end 标记建立内容监督 mask，CPU 上由 Numba 扫描。
+# 这是 loss 监督范围，不是 attention 可见性：用户 prompt 虽不计 loss，仍能作为上下文。
 import numba
 import numpy as np
 import torch
 
 
+# 顺序查找完整 header，跳过 header 后指定 token，再标记直到 end 前的内容。
+# 若未找到 end，则标记剩余尾部；输出原地写入 out，header/end 本身不监督。
 @numba.njit(cache=True)
 def _numba_loss_mask(ids, header, header_len, end, end_len, out, skip_after):
     n = len(ids)
@@ -56,6 +60,7 @@ def _numba_loss_mask(ids, header, header_len, end, end_len, out, skip_after):
     return out
 
 
+# 必要时将 CUDA token 搬到 CPU、转 int64 并连续化，确保 Numba 获取稳定的一维数组布局。
 def _to_contiguous_int64_numpy(t: torch.Tensor) -> np.ndarray:
     if t.is_cuda:
         t = t.cpu()
@@ -65,6 +70,8 @@ def _to_contiguous_int64_numpy(t: torch.Tensor) -> np.ndarray:
     return t.numpy()
 
 
+# 把标记 id 转 NumPy，调用扫描器后可只保留最后一段连续 1，再搬回原输入设备。
+# last_turn_only 实际按最后连续内容段截取；skip_after_header 用于处理模板换行与 BPE 合并。
 def compute_assistant_loss_mask(
     input_ids: torch.Tensor,
     assistant_header_ids: list[int],

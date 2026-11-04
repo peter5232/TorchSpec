@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 教师数据生成协议与 Hugging Face 实现。用少量 hook 捕获指定层而不返回全部层激活，节约显存。
+# auxiliary hidden 与 final-norm 后 hidden 分开传递：前者训练特征融合，后者用于生成教师词表分布。
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional
@@ -40,6 +42,8 @@ class Eagle3TargetOutput:
     # when mooncake uses the TCP/host-buffer path (data already passes through CPU).
     input_ids_cpu: Optional[torch.Tensor] = None
 
+    # 只导出非 None 的可选张量，加上必须的 hidden/input_ids，形成传输或存储使用的扁平字段字典。
+    # input_ids_cpu 是可复用 CPU 副本，用于 loss mask 扫描避免 GPU→CPU 再搬一次。
     def to_tensor_dict(self) -> dict[str, torch.Tensor]:
         tensors = {
             "hidden_states": self.hidden_states,
@@ -61,9 +65,11 @@ class Eagle3TargetModel(ABC):
     Abstract interface for the target model backend used to generate Eagle3 training data.
     """
 
+    # 初始化待配置的辅助层列表，后续设置后才能知道要捕获哪几路教师特征。
     def __init__(self):
         self.aux_hidden_states_layers = None
 
+    # 抽象后端构造契约：接受模型位置、dtype、device 与缓存参数，具体后端负责加载策略。
     @classmethod
     @abstractmethod
     def from_pretrained(
@@ -78,6 +84,7 @@ class Eagle3TargetModel(ABC):
         Initialize the target model backend from a pretrained model path.
         """
 
+    # 抽象数据生成契约：输入 token/attention/loss mask，输出隐藏态与监督所需元数据。
     @abstractmethod
     def generate_eagle3_data(
         self,
@@ -89,6 +96,8 @@ class Eagle3TargetModel(ABC):
         Generate the eagle3 data from the target model.
         """
 
+    # 未指定时选 [1,L//2-1,L-4] 三路教师层；显式列表支持 DFlash 等更多路特征。
+    # 拒绝空列表，层号表示实际 decoder block 索引，不是 HF hidden_states 中含 embedding 的索引。
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
     ) -> None:
@@ -115,10 +124,12 @@ class Eagle3TargetModel(ABC):
 
 
 class HFTargetModel(Eagle3TargetModel):
+    # 包装已构造的 HF 模型并继承辅助层配置字段，不重新加载或复制模型参数。
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
 
+    # TP>1 时传 auto tp_plan 和指定 device_mesh，单卡则使用 device_map，再交 HF 完成加载。
     @classmethod
     def from_pretrained(
         cls,
@@ -154,6 +165,7 @@ class HFTargetModel(Eagle3TargetModel):
         )
         return cls(target_model)
 
+    # 按常见模型包装层定位 decoder blocks，找不到时显式报错以防 hook 注册在错误模块。
     def _get_transformer_layers(self):
         """
         Helper to find the module list containing the transformer layers.
@@ -170,6 +182,7 @@ class HFTargetModel(Eagle3TargetModel):
                 "Could not locate transformer layers in the model architecture to register hooks."
             )
 
+    # 定位 norm/ln_f 等 final norm 模块，捕获其输出才能直接接教师 LM head。
     def _get_final_norm(self) -> nn.Module:
         """
         Helper to find the final norm layer (post-transformer, pre-lm_head).
@@ -186,6 +199,8 @@ class HFTargetModel(Eagle3TargetModel):
                 "Could not locate final norm layer in the model architecture to register hook."
             )
 
+    # 在 no_grad 下注册指定 block 和 final norm hook，关闭 cache/全层返回后执行一次 teacher forward。
+    # finally 移除 hook，验证捕获数量，再按配置顺序拼成 [B,S,K*H]；last_hidden_states 是 post-norm。
     @torch.no_grad()
     def generate_eagle3_data(
         self,
@@ -202,7 +217,9 @@ class HFTargetModel(Eagle3TargetModel):
         last_hidden = {}
         handles = []
 
+        # 为每个 layer_idx 创建独立闭包，避免循环变量晚绑定导致多层覆盖同一字典项。
         def get_hook(layer_idx):
+            # 兼容 block 的 Tensor/tuple 返回，将首个隐藏态保存到对应层号，不拷贝所有层激活。
             def hook(module, input, output):
                 if isinstance(output, tuple):
                     hidden = output[0]
@@ -212,6 +229,7 @@ class HFTargetModel(Eagle3TargetModel):
 
             return hook
 
+        # 保存 final norm 的输出供教师 head 使用，避免重复 norm 或误用最后 block 的 pre-norm 状态。
         def norm_hook(module, input, output):
             last_hidden["value"] = output
 

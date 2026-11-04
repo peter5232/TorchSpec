@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 模型训练包装器的公共入口：EAGLE3 做多深度展开，DFlash 家族做锚点块预测。
+# 参数骨干在 draft/，冻结教师在 target/，这里仅组织导入与公开 API。
 from torchspec.models.dflash import DFlashModel
 from torchspec.models.dflash2 import DFlash2Model
 from torchspec.models.dspark import DSparkModel

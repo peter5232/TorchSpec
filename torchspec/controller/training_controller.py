@@ -18,6 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：训练流水线的样本账本。负责“哪条数据该给谁”，不负责 teacher forward。
+# prompt_buffer 保存待推理输入，sample_pool 保存已完成的 Mooncake key；train_queues 送往训练 rank。
+# 这些容器中的大模型输出只是元数据，真正的 hidden states 留在 Mooncake。
+# 本文件还保留整个已处理数据集以便下一 epoch 重排；这是与仅保存输出 key 不同的一层状态。
+# 注意模块原有 batch 公式概述；当前 USP 的派生规则应以 train_entry._resolve_batch_size 为准。
+
 """
 Async Training Controller for decoupled inference and training.
 
@@ -66,6 +72,7 @@ from torchspec.utils.types import InferenceInput, InferenceOutput
 _estimate_bytes = estimate_tensor_bytes
 
 
+# 滑动窗口统计样本吞吐；总计数与短窗口速率分开，既能看瞬时趋势也能计算全程平均。
 @dataclass
 class SpeedMonitor:
     """Tracks throughput over a sliding time window."""
@@ -75,6 +82,7 @@ class SpeedMonitor:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _total_count: int = 0
 
+    # 在锁内添加 (时间, 数量)，累计总数并裁掉过期事件，避免并发更新破坏队列。
     def record(self, count: int = 1) -> None:
         """Record count entries at current time."""
         now = time.time()
@@ -83,12 +91,14 @@ class SpeedMonitor:
             self._total_count += count
             self._prune_old_events(now)
 
+    # 移除窗口左侧的旧事件；只调整用于测速的历史，不减少全程总计数。
     def _prune_old_events(self, now: float) -> None:
         """Remove events outside the window."""
         cutoff = now - self.window_seconds
         while self._events and self._events[0][0] < cutoff:
             self._events.popleft()
 
+    # 用窗口内样本数除以从最老事件到当前的时间；空窗口或不足 1ms 返回零，避免无穷大。
     def get_speed(self) -> float:
         """Get current speed in entries/sec over the window."""
         now = time.time()
@@ -104,11 +114,13 @@ class SpeedMonitor:
                 return 0.0
             return window_count / elapsed
 
+    # 返回启动以来累计处理的条数；不是当前窗口中的样本数。
     def get_total_count(self) -> int:
         """Get total count since start."""
         return self._total_count
 
 
+# Ray actor 是远程常驻对象；保存数据、分发元数据和统计容量，使多个生产者共享一个调度视图。
 @ray.remote
 class AsyncTrainingController:
     """Central controller for async training pipeline.
@@ -122,6 +134,10 @@ class AsyncTrainingController:
       - Monitors inference and training throughput
     """
 
+    # 分别初始化待推理输入、训练结果池、评估结果池及队列。
+    # queue_count=DP×SP：同一 DP 组内的 SP rank 收到同一个样本基础 key 的描述，
+    # 但当前 USP 由生产侧预先切片，每个消费者实际读取自己的 base_usp{rank} 分片 key。
+    # _pool_bytes 只跟踪尚在训练 sample_pool 中的估算字节数，不等于整个 Mooncake 的实时物理占用。
     def __init__(self, args, dp_size: int):
         self.args = args
         self.dp_size = dp_size
@@ -137,6 +153,8 @@ class AsyncTrainingController:
 
         self.sample_pool: deque[InferenceOutput] = deque()
         self._pool_lock = threading.Lock()
+        # 字节账本对应“尚未 dispatch 的训练结果”。张量从池里移到训练队列后仍可能在存储中。
+        # 所以调度背压必须结合在途量和客户端容量理解，不能把这个字段当作显存 allocator 的计量。
         self._pool_bytes = 0
         self._sample_bytes: dict[str, int] = {}
 
@@ -168,6 +186,7 @@ class AsyncTrainingController:
         self._last_dispatch_log_time = 0.0
         self._inference_error: str | None = None
 
+    # 生成此控制器生命周期内递增的样本标识，用于关联异步请求与结果；它不是数据内容的哈希。
     def _generate_data_id(self) -> str:
         self._data_id_counter += 1
         return f"data_{self._data_id_counter}"
@@ -176,6 +195,9 @@ class AsyncTrainingController:
     # Dataset Loading
     # ─────────────────────────────────────────────────────────────
 
+    # 把原始条目统一成 InferenceInput 并追加到待推理队列，返回加入数量。
+    # 已有 input_ids 却无 loss mask 时要求开启动态 mask，否则无法知道哪些 token 应监督。
+    # 不在这里生成 teacher 特征；这里只准备后续推理的输入。
     def add_dataset(self, dataset: list) -> int:
         with self._prompt_lock:
             for sample in dataset:
@@ -210,6 +232,8 @@ class AsyncTrainingController:
                 self.prompt_buffer.append(entry)
             return len(dataset)
 
+    # 按 train/eval 选择数据来源；offline 只读取清单 ID 和长度，在线模式执行对话预处理。
+    # 评估用浅拷贝 args 改路径，避免意外把后续训练的数据路径改成验证集。
     def _load_dataset_split(self, args, split: str) -> list:
         """Load one split from either replay records or conversation data."""
         if split not in ("train", "eval"):
@@ -244,6 +268,7 @@ class AsyncTrainingController:
                 dataset_args.prompt_key = args.eval_prompt_key
         return load_conversation_dataset(dataset_args)
 
+    # 载入并保留训练数据；空数据立即失败，防止后续消费者一直等待不可能产生的样本。
     def load_dataset(self, args) -> int:
         """Load and store the training dataset for later epochs."""
         self._stored_dataset = self._load_dataset_split(args, "train")
@@ -259,6 +284,8 @@ class AsyncTrainingController:
         logger.info(f"Controller loaded dataset: {len(self._stored_dataset)} samples")
         return len(self._stored_dataset)
 
+    # 复制保存的数据，再以 seed+epoch 打乱、按长度局部分组并跳过已消费前缀。
+    # 随机种子可复现顺序，但异步在途结果没有完整保存，因此 resume 的数据进度仅尽力恢复。
     def _prepare_dataset(self, skip: int = 0) -> list:
         """Return dataset for the current epoch, optionally shuffled and length-grouped.
 
@@ -275,6 +302,8 @@ class AsyncTrainingController:
             rng = random.Random(self._dataset_seed + self._dataset_epoch)
             rng.shuffle(data)
 
+        # 先打乱再局部长度分组：保留随机组顺序，同时让相邻 batch 的序列长度更接近。
+        # 如果全局排序，训练前后见到的内容长度分布会系统变化；这里避免这种额外课程效应。
         data = length_grouped_order(data, self._length_group_size)
 
         if skip > 0:
@@ -292,6 +321,7 @@ class AsyncTrainingController:
         )
         return data
 
+    # 设定当前 epoch 后提交重排后的数据；skip 用于恢复到已完成 optimizer 步数对应的近似位置。
     def submit_training_dataset(self, epoch: int = 0, skip: int = 0) -> int:
         """Submit the stored training dataset to the prompt buffer for inference.
 
@@ -303,12 +333,15 @@ class AsyncTrainingController:
         self._dataset_epoch = epoch
         return self.add_dataset(self._prepare_dataset(skip=skip))
 
+    # 递增 epoch 并重新投递保留的数据集，不重新从磁盘 tokenize。
     def reload_dataset(self) -> int:
         """Re-add the stored dataset to the prompt buffer (epoch reload)."""
         assert self._stored_dataset is not None, "No stored dataset to reload"
         self._dataset_epoch += 1
         return self.add_dataset(self._prepare_dataset())
 
+    # 将验证集截到 DP 数量的整数倍，确保每次评估分发时各数据副本都有样本。
+    # 例如 10 条、DP=4，只保留 8 条；这是本实现的组批取舍，并非验证集本身只有 8 条。
     def load_eval_dataset(self, args) -> int:
         """Load eval dataset on the controller and store it. Returns size (0 if none)."""
         raw_dataset = self._load_dataset_split(args, "eval")
@@ -325,6 +358,7 @@ class AsyncTrainingController:
         logger.info(f"Controller loaded eval dataset: {count} samples")
         return count
 
+    # 返回已载入训练集长度；尚未载入时显式报错，不能用零冒充正常空集。
     def get_dataset_size(self) -> int:
         if self._stored_dataset is None:
             raise RuntimeError(
@@ -333,9 +367,11 @@ class AsyncTrainingController:
             )
         return len(self._stored_dataset)
 
+    # 返回截断后的验证集大小，未配置验证数据时返回零供上层关闭评估。
     def get_eval_dataset_size(self) -> int:
         return len(self._stored_eval_dataset) if self._stored_eval_dataset is not None else 0
 
+    # 从已 tokenized 的训练数据统计草稿词表映射；纯文本延迟分词模式没有 input_ids，不能直接统计。
     def compute_vocab_mapping(self, target_vocab_size: int, draft_vocab_size: int) -> tuple:
         """Generate vocab mapping on the controller using the stored dataset.
 
@@ -359,6 +395,7 @@ class AsyncTrainingController:
     # Interface for Inference Manager
     # ─────────────────────────────────────────────────────────────
 
+    # 从待推理队列头部取走最多 num_prompts 条；取走后由推理管理器负责它们的后续处理。
     def get_prompts(self, num_prompts: int) -> list[InferenceInput]:
         """Inference manager gets prompts with data_ids.
 
@@ -374,6 +411,8 @@ class AsyncTrainingController:
                 entries.append(self.prompt_buffer.popleft())
             return entries
 
+    # 按 data_id 将结果分流到训练或评估池；训练项按 shape/dtype 估算存储字节。
+    # 这里只保存 key 和元数据，不下载张量。返回本次添加训练结果后的池字节，只有评估结果时为零。
     def push_inference_results(self, results: list[InferenceOutput]) -> int:
         """Inference sends back (data_id, mooncake_key) pairs.
 
@@ -416,6 +455,7 @@ class AsyncTrainingController:
         self._inference_monitor.record(len(results))
         return pool_bytes
 
+    # 报告仍在控制器中的输入数；不包含推理管理器本地缓冲和引擎中正在执行的请求。
     def get_prompt_buffer_size(self) -> int:
         """Get current size of prompt buffer."""
         return len(self.prompt_buffer)
@@ -424,10 +464,13 @@ class AsyncTrainingController:
     # Interface for Training
     # ─────────────────────────────────────────────────────────────
 
+    # 将队列句柄交给训练组；SP 开启时队列实际按 DP×SP 展开。
     def get_train_queues(self) -> list[Queue]:
         """Get the per-DP training queues."""
         return self.train_queues
 
+    # 把等待分发的训练和评估条目一起计数，供推理侧限流。
+    # 已发到训练队列但尚未删除的张量不在此计数里，因此它不是所有存储对象的总数。
     def get_pool_size(self) -> int:
         """Total mooncake-resident samples (training + eval) for backpressure.
 
@@ -439,6 +482,7 @@ class AsyncTrainingController:
         with self._eval_pool_lock:
             return train_size + len(self.eval_pool)
 
+    # 在锁内返回训练结果池的字节账本；评估池和在途/已分发对象不包含在这个值中。
     def get_pool_bytes(self) -> int:
         """Get current bytes in sample pool (for Mooncake backpressure)."""
         with self._pool_lock:
@@ -448,10 +492,14 @@ class AsyncTrainingController:
     # Dispatch Logic
     # ─────────────────────────────────────────────────────────────
 
+    # 记录推理 actor 的致命错误，让下一次训练分发抛出异常，而非无限等待新样本。
     def set_inference_error(self, msg: str) -> None:
         """Called by the inference manager when a fatal error occurs."""
         self._inference_error = msg
 
+    # 只有结果池足够组成一个完整 dispatch 才取出样本并发到各训练队列。
+    # 取出时扣减池字节仅表示控制权交给消费者，并不代表 Mooncake 内存此时已释放。
+    # 返回 False 表示暂时缺数据；致命推理错误则抛异常，二者必须区分。
     def try_dispatch_batch(self) -> bool:
         """Try to dispatch one batch to training queues.
 
@@ -490,6 +538,8 @@ class AsyncTrainingController:
             for _ in range(self.dispatch_batch_size):
                 result = self.sample_pool.popleft()
                 sample_bytes = self._sample_bytes.pop(result.mooncake_key, 0)
+                # 这一减法只是结果池出账。真正 remove 要等消费者安全拿到所需数据后执行，
+                # 当前 USP 消费者读取并清理各自分片 key；这里的基础 key 出账不代表所有分片均已消费。
                 self._pool_bytes -= sample_bytes
                 batch_results.append(result)
 
@@ -503,12 +553,16 @@ class AsyncTrainingController:
         self.batch_id += 1
         return True
 
+    # 从 input_ids 的最后一维读取序列长度；缺少形状时以零参与负载排序。
     @staticmethod
     def _seq_len(result: InferenceOutput) -> int:
         shapes = result.tensor_shapes or {}
         ids_shape = shapes.get("input_ids")
         return ids_shape[-1] if ids_shape else 0
 
+    # 按序列长度从长到短，把样本放到当前总长度最小且未满的 DP rank。
+    # 例如长度 [8,7,2,1]、DP=2、每 rank 两条，分为 [8,1] 与 [7,2]，都承担 9 个 token。
+    # 同时限制条数，避免某 rank 提前耗尽 batch；不规则数量或每 rank 至多一条时回退轮询。
     def _partition_results(self, results: list[InferenceOutput]) -> list[list[InferenceOutput]]:
         """Partition InferenceOutputs across DP ranks.
 
@@ -526,6 +580,8 @@ class AsyncTrainingController:
                 partitions[i % self.dp_size].append(result)
             return partitions
 
+        # 贪心平衡同时满足“每 rank 条数相等”和“累计 token 尽量接近”。
+        # 前者保证每个消费者取到预期数量，后者减少同步训练中等待最慢 rank 的时间。
         capacity = len(results) // self.dp_size
         loads = [0] * self.dp_size
         for result in sorted(results, key=self._seq_len, reverse=True):
@@ -537,6 +593,9 @@ class AsyncTrainingController:
             loads[min_rank] += self._seq_len(result)
         return partitions
 
+    # 将推理结果包装成 TrainSample；不同 DP rank 收不同分组，同一 DP 的 SP rank 收同一描述。
+    # 复制的是基础 key/shape/mask 等元数据，不是在 Python 中复制大张量。
+    # 当前 USP 生产侧已切片，消费者按 rank 派生分片 key，并重建对应的 mask/position 信息。
     def _dispatch_to_queues(
         self,
         batch_results: list[InferenceOutput],
@@ -558,12 +617,15 @@ class AsyncTrainingController:
                     data_id=result.data_id,
                 )
                 if self.sp_size > 1 and len(queues) == self.queue_count:
+                    # 把同一个 TrainSample 放到同一 DP 组各独立队列，相当于广播元数据。
+                    # 若只让多个 rank 消费同一条共享队列，一次 get 会取走条目，其他 rank 并不会自动得到副本。
                     start = dp_rank * self.sp_size
                     for rank in range(start, start + self.sp_size):
                         queues[rank].put(sample)
                 else:
                     queues[dp_rank].put(sample)
 
+    # 把单条服务端采集结果复用批量入池路径，保持统计与 train/eval 分流规则一致。
     def push_inference_sample(self, sample: InferenceOutput) -> int:
         """Add a single inference sample to the training pool.
 
@@ -582,6 +644,8 @@ class AsyncTrainingController:
     # Eval Pipeline
     # ─────────────────────────────────────────────────────────────
 
+    # 构建评估输入并记录 ID 集合以识别异步回包。
+    # 在线 ID 加 eval_ 前缀；offline 必须保留清单中的原始 ID 才能找到磁盘样本。
     def _build_eval_entries(self, dataset: list) -> list[InferenceInput]:
         eval_entries: list[InferenceInput] = []
         for sample in dataset:
@@ -609,6 +673,8 @@ class AsyncTrainingController:
             eval_entries.append(entry)
         return eval_entries
 
+    # 将验证集切片插入待推理队列前端；先 reversed 再 extendleft，保持切片内部原有顺序。
+    # 小块提交使训练端有机会及时取走结果，避免整个验证集同时占满张量存储。
     def submit_eval_chunk(self, start: int, end: int) -> int:
         """Submit a slice of the stored eval dataset for inference."""
         assert self._stored_eval_dataset is not None, "No stored eval dataset"
@@ -630,13 +696,16 @@ class AsyncTrainingController:
         )
         return len(chunk)
 
+    # 在评估锁内读取等待分发的结果数量，用于判断缓存构建进度。
     def get_eval_pool_size(self) -> int:
         with self._eval_pool_lock:
             return len(self.eval_pool)
 
+    # 返回独立的评估队列句柄，避免验证样本被训练迭代器消费。
     def get_eval_queues(self) -> list[Queue]:
         return self.eval_queues
 
+    # 凑齐一个评估 dispatch 后出池，按同一分区规则发送并累计已分发数；不足则返回 False。
     def try_dispatch_eval_batch(self) -> bool:
         """Dispatch one eval batch from the pool if enough samples are available."""
         bs = self.eval_dispatch_batch_size
@@ -653,6 +722,8 @@ class AsyncTrainingController:
         )
         return True
 
+    # 确认预期样本已到齐且没有完整批次滞留，再清空评估 ID 和计数状态。
+    # 这里只清控制器跟踪状态，张量的下载、缓存和释放由消费者/存储层处理。
     def finalize_eval_dispatch(self) -> None:
         """Assert all eval batches were dispatched, then clean up tracking state.
 
@@ -688,6 +759,7 @@ class AsyncTrainingController:
     # Status and Monitoring
     # ─────────────────────────────────────────────────────────────
 
+    # 报告控制器本地排队状态，适合判断数据是否不足；不代表引擎内部的实时请求数。
     def get_status(self) -> dict:
         """Get current status of controller."""
         return {
@@ -697,6 +769,7 @@ class AsyncTrainingController:
             "dispatch_batch_size": self.dispatch_batch_size,
         }
 
+    # 同时输出短窗口速率、全程样本数和平均速率；training_speed 统计的是分发速度，不是 GPU 实测速度。
     def get_speeds(self) -> dict:
         """Get current throughput speeds in entries/sec."""
         elapsed = time.time() - self._start_time
@@ -714,12 +787,14 @@ class AsyncTrainingController:
             ),
         }
 
+    # 将队列状态和吞吐统计合并为一次远程返回，减少主循环多次 RPC。
     def get_full_status(self) -> dict:
         """Get complete status including speeds."""
         status = self.get_status()
         status.update(self.get_speeds())
         return status
 
+    # 给每个训练队列放入 None 结束哨兵，通知阻塞读取的消费者停止；不强行杀掉 actor。
     def shutdown(self) -> None:
         """Signal training workers to stop by sending None to queues."""
         for q in self.train_queues:

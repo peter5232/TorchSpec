@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Hugging Face 后端的远程外壳：处理 actor 的 GPU 定位、日志和 ObjectRef，模型计算交给 HFRunner。
+# 这条路径最接近常规 PyTorch 前向，适合先理解 teacher 数据如何变成训练样本。
+
 """
 HF Ray actor engine for distributed deployment across multiple nodes.
 
@@ -36,6 +39,7 @@ from torchspec.ray.ray_actor import RayActor
 from torchspec.utils.logging import logger, setup_file_logging
 
 
+# 把普通 HFRunner 包装成 Ray 可部署对象；实例创建和真正加载权重分开。
 class HFEngine(InferenceEngine, RayActor):
     """Ray actor wrapper for HFRunner with distributed deployment support.
 
@@ -45,6 +49,7 @@ class HFEngine(InferenceEngine, RayActor):
     Accepts pre-tokenized input_ids and loss_mask instead of raw prompts.
     """
 
+    # 保存 rank、GPU 基址及尚未初始化的 runner；日志按引擎组区分，构造阶段不加载权重。
     def __init__(
         self,
         args,
@@ -59,6 +64,7 @@ class HFEngine(InferenceEngine, RayActor):
         self._mooncake_config = None
         setup_file_logging("inference", self.rank, group=engine_group)
 
+    # 先将物理 GPU 映射到 actor 可见设备，再检查 Mooncake 可达性并加载目标模型及捕获层配置。
     def init(self, mooncake_config=None) -> None:
         """Initialize the HFRunner on the allocated GPU.
 
@@ -97,6 +103,8 @@ class HFEngine(InferenceEngine, RayActor):
 
         logger.info(f"HFEngine rank {self.rank}: initialized from {self.args.target_model_path}")
 
+    # 解引用输入张量列表，合并批次标识并交给 runner；packed loss mask 原样随样本传递。
+    # 此实现没有使用文本、多模态和返回选项；实际输出由 runner 的完整 teacher 前向决定。
     def generate(
         self,
         data_id: str | list[str],
@@ -148,10 +156,12 @@ class HFEngine(InferenceEngine, RayActor):
         )
         return result
 
+    # 只判断 runner 是否已创建；timeout 在此实现中不触发额外探测。
     def health_check(self, timeout: float = 5.0) -> bool:
         """Check if the engine is healthy."""
         return self._engine is not None
 
+    # 先让 runner 回收存储和模型，再清空引用，使后续生成明确报未初始化。
     def shutdown(self) -> None:
         """Clean up resources."""
         if self._engine is not None:
@@ -159,6 +169,7 @@ class HFEngine(InferenceEngine, RayActor):
             self._engine = None
         logger.info(f"HFEngine rank {self.rank}: shutdown complete")
 
+    # 汇报 actor 的 rank、初始化标志和 GPU 基址，供编排层查看部署位置。
     def get_status(self) -> dict:
         """Get engine status."""
         return {

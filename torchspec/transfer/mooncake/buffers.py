@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 管理可复用的 CPU pinned/GPU 字节缓冲，以及后台 Mooncake 写入的 Future。
+# 缓冲池只负责轮转，不自行判断是否可覆写；调用方必须在复用同一指针前等待对应传输结束。
+
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
@@ -27,6 +30,7 @@ import torch
 from torchspec.utils.logging import logger
 
 
+# 用 uint8 pinned CPU 张量拥有一段稳定字节内存；RDMA 注册由上层 store 完成，而不是构造器自动完成。
 class HostBuffer:
     """
     RDMA-registered host buffer using pinned CPU memory.
@@ -34,16 +38,19 @@ class HostBuffer:
     Provides a reusable buffer for zero-copy transfers to Mooncake Store.
     """
 
+    # 按字节分配 page-locked 主机张量并记录地址，使 CUDA 可以直接异步复制到目的内存。
     def __init__(self, size: int):
         self.size = size
         # Allocate pinned CPU memory for RDMA compatibility
         self._tensor = torch.empty(size, dtype=torch.uint8, pin_memory=True)
         self._ptr = self._tensor.data_ptr()
 
+    # 返回底层分配首地址供原生传输接口使用；它不是可跨机器直接解引用的 Python 数据。
     @property
     def ptr(self) -> int:
         return self._ptr
 
+    # 把连续张量按字节复制到指定偏移，检查容量并返回实际字节数；non_blocking 只入队，不代表数据已可交给网卡读取。
     def copy_from_tensor(self, tensor: torch.Tensor, offset: int = 0) -> int:
         """
         Copy tensor data into this host buffer at the given offset.
@@ -68,27 +75,32 @@ class HostBuffer:
 
         return nbytes
 
+    # 释放持有的张量并将地址归零；调用者须已确保没有 CUDA 拷贝或后台 put 还在使用它。
     def free(self) -> None:
         if self._tensor is not None:
             del self._tensor
             self._tensor = None
             self._ptr = 0
 
+    # 对象析构时调用同一释放逻辑，作为显式生命周期清理之外的兜底。
     def __del__(self):
         self.free()
 
 
+# 固定数量缓冲形成环形复用，容量限制给生产速度提供背压，而不是无限积累复制任务。
 class HostBufferPool:
     """
     Pool of RDMA-registered host buffers for tensor storage.
     """
 
+    # 仅记录单块大小、块数和当前下标，实际 pinned 内存在 initialize 中申请。
     def __init__(self, buffer_size: int = 4 * 1024**3, pool_size: int = 2):
         self.buffer_size = buffer_size
         self.pool_size = pool_size
         self._buffers: List[HostBuffer] = []
         self._current_idx = 0
 
+    # 一次预分配所有主机缓冲，后续样本复用这些分配以避免反复注册内存。
     def initialize(self) -> None:
         """Pre-allocate all buffers."""
         for _ in range(self.pool_size):
@@ -99,20 +111,25 @@ class HostBufferPool:
             self.buffer_size / (1024**3),
         )
 
+    # 按轮转取下一块，池为空则初始化；它不会等待旧写入，等待责任在 AsyncPutManager。
     def get_buffer(self) -> HostBuffer:
         """Get the next buffer (round-robin)."""
         if not self._buffers:
             self.initialize()
+        # 两块缓冲 A/B 可先后装入两批数据；第三批再次拿到 A 时，
+        # 上层 wait_for_buffer(A.ptr) 会等第一批传输结束，避免用新数据覆盖网卡还在读的旧数据。
         buf = self._buffers[self._current_idx]
         self._current_idx = (self._current_idx + 1) % len(self._buffers)
         return buf
 
+    # 逐块释放主机内存并清空列表；上层先 drain 后台任务才能安全调用。
     def shutdown(self) -> None:
         for buf in self._buffers:
             buf.free()
         self._buffers.clear()
 
 
+# 按拥有缓冲的基址记录 Future，将 CUDA 拷贝完成等待和 RDMA 写入移到后台线程。
 class AsyncPutManager:
     """Runs batch_put_from on a background thread so the caller can return immediately.
 
@@ -125,6 +142,7 @@ class AsyncPutManager:
     because ``MooncakeDistributedStore`` is not thread-safe for concurrent puts.
     """
 
+    # 建立线程池、在途表和首个错误槽；put 锁串行化原生 store 调用，多个线程仍可重叠等待 CUDA 事件。
     def __init__(self, store: Any, max_workers: int = 1, replicate_config: Any = None):
         self._store = store
         self._replicate_config = replicate_config
@@ -133,6 +151,7 @@ class AsyncPutManager:
         self._last_error: Optional[BaseException] = None
         self._put_lock = threading.Lock()
 
+    # 取出并清空缓存的异常后重新抛出，使异步失败在调用线程可见且不会永久重复报告。
     def check_last_error(self) -> None:
         """Re-raise the first async failure that hasn't been surfaced yet."""
         if self._last_error is not None:
@@ -140,6 +159,7 @@ class AsyncPutManager:
             self._last_error = None
             raise err
 
+    # 只检查已完成的 Future，回收成功项并上报失败，不等待正在传输的缓冲。
     def check_errors(self) -> None:
         """Surface completed async failures without waiting for active puts.
 
@@ -158,6 +178,7 @@ class AsyncPutManager:
                 self._last_error = exc
                 self.check_last_error()
 
+    # 阻塞等待指定基址的旧任务，完成后才允许写入新样本；这是缓冲轮转时真正的背压点。
     def wait_for_buffer(self, buffer_ptr: int) -> None:
         """Block until the in-flight transfer using *buffer_ptr* finishes.
 
@@ -172,6 +193,7 @@ class AsyncPutManager:
             self._last_error = exc
             raise
 
+    # 提交指针、长度及可选 CUDA 事件到线程池，以拥有整块内存的基址登记任务，而非每个子张量的偏移地址。
     def submit(
         self,
         keys: List[str],
@@ -202,6 +224,7 @@ class AsyncPutManager:
         )
         self._in_flight[owner_buffer_ptr] = future
 
+    # 后台线程先选择事件所属 GPU 并等待 DtoH 完成，再在锁内调用 batch_put_from；任一写入失败就尽力清理整批键并报错。
     def _do_put(
         self,
         keys: List[str],
@@ -234,6 +257,7 @@ class AsyncPutManager:
             detail = ", ".join(f"{k} (code={r})" for k, r in failures)
             raise RuntimeError(f"async batch_put_from failed: {detail}")
 
+    # 等待全部在途任务，把首个异常缓存给后续 check_last_error，同时清空在途表；本方法自身只记录异常。
     def drain(self) -> None:
         """Wait for every in-flight transfer to finish."""
         for ptr, future in list(self._in_flight.items()):
@@ -245,12 +269,14 @@ class AsyncPutManager:
                 logger.warning("async put error during drain: %s", exc)
         self._in_flight.clear()
 
+    # 先排空已提交工作再关闭线程池，保证缓冲释放前不再有后台读访问。
     def shutdown(self) -> None:
         """Drain pending work and shut down the thread pool."""
         self.drain()
         self._executor.shutdown(wait=True)
 
 
+# GPU 发送和接收缓冲的共同拥有者；以 uint8 表示原始字节，具体 dtype 在解释张量时恢复。
 class _GPUBuffer:
     """Base class for RDMA-registered GPU buffers (send and receive).
 
@@ -260,6 +286,7 @@ class _GPUBuffer:
 
     _label: str = "GPU"  # overridden by subclasses for log messages
 
+    # 保存字节容量和设备但不立即分配显存；首地址为零表示尚未初始化。
     def __init__(self, size: int, device: torch.device = None):
         self.size = size
         self.device = torch.device(device) if device is not None else torch.device("cuda")
@@ -267,6 +294,7 @@ class _GPUBuffer:
         self._ptr: int = 0
         self._initialized = False
 
+    # 在指定设备申请连续字节张量，初始化标志避免重复申请；注册 RDMA 仍由 store 负责。
     def initialize(self) -> None:
         if self._initialized:
             return
@@ -280,10 +308,12 @@ class _GPUBuffer:
             self.device,
         )
 
+    # 返回 GPU 内存基址，供已经注册该分配的传输引擎使用。
     @property
     def ptr(self) -> int:
         return self._ptr
 
+    # 清空显存张量、地址和初始化标志；释放前必须由上层完成传输同步。
     def free(self) -> None:
         if self._tensor is not None:
             del self._tensor
@@ -291,10 +321,12 @@ class _GPUBuffer:
             self._ptr = 0
             self._initialized = False
 
+    # 析构时回收显存引用，不能替代上层对在途 RDMA 的等待。
     def __del__(self):
         self.free()
 
 
+# 承接远端张量的可复用接收区；切片是共享内存视图，下一次接收可覆盖旧内容。
 class GPUReceiveBuffer(_GPUBuffer):
     """RDMA-registered GPU buffer for receiving tensors via GPU Direct RDMA.
 
@@ -304,6 +336,7 @@ class GPUReceiveBuffer(_GPUBuffer):
 
     _label = "GPU receive"
 
+    # 返回 [offset, offset+size) 的字节视图，不复制；上层随后 view(dtype) 和 reshape 解释形状。
     def get_slice(self, offset: int, size: int) -> torch.Tensor:
         """Get a slice of the buffer as a tensor view."""
         if not self._initialized:
@@ -311,6 +344,7 @@ class GPUReceiveBuffer(_GPUBuffer):
         return self._tensor[offset : offset + size]
 
 
+# 先用设备内复制把样本放到已注册显存，再供网卡读取，省去隐藏张量的 GPU→CPU 中转。
 class GPUSendBuffer(_GPUBuffer):
     """RDMA-registered GPU buffer for sending tensors via GPU Direct RDMA.
 
@@ -322,6 +356,7 @@ class GPUSendBuffer(_GPUBuffer):
 
     _label = "GPU send"
 
+    # 检查初始化和容量，按字节把同设备连续源张量拷到发送区；调用返回仅表示 CUDA 操作已提交。
     def copy_from_tensor(self, tensor: torch.Tensor, offset: int = 0) -> int:
         """Copy tensor data into this GPU buffer at the given offset.
 

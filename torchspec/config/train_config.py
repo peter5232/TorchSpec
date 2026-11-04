@@ -18,6 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：配置从结构化 YAML 到历史扁平 args 的桥梁。
+# load_config 按 schema → base → 文件 → CLI 的顺序覆盖，再校验；config_to_flat_args 派生运行参数。
+# 阅读配置时区分数据语义（哪些 token 监督）、模型结构、训练并行和推理资源，避免把同名“batch”混用。
+# 这里的 dataclass 默认值是现有运行契约，注释分支只解释它们，不调整默认行为。
+
 import argparse
 import os
 from dataclasses import dataclass, field
@@ -31,6 +36,7 @@ from torchspec.data.utils import is_local_data_path
 from torchspec.utils.logging import logger
 
 
+# 数据格式、分词位置、监督范围及评估输入设置；last_turn_loss_only=auto 根据样本思考内容做决定。
 @dataclass
 class DatasetConfig:
     chat_template: Optional[str] = "llama3"
@@ -48,6 +54,7 @@ class DatasetConfig:
     train_data_path: str = ""
 
 
+# 可选性能计时、显存记录和张量 dump 开关；诊断本身可能带来同步、I/O 和额外存储成本。
 @dataclass
 class DebugConfig:
     enable_perf_metrics: bool = True
@@ -65,6 +72,7 @@ class DebugConfig:
     use_pytorch_profiler: bool = False
 
 
+# 选择指标后端及运行身份；此处只声明参数，真正初始化在 utils/logging.py。
 @dataclass
 class LoggingConfig:
     report_to: str = "none"
@@ -81,6 +89,7 @@ class LoggingConfig:
     wandb_team: Optional[str] = None
 
 
+# 区分目标模型路径、草稿结构和初始草稿权重；embedding/lm_head/norm 的 key 是加载权重时的名称契约。
 @dataclass
 class ModelConfig:
     draft_model_config: Optional[str] = None
@@ -95,6 +104,8 @@ class ModelConfig:
     trust_remote_code: bool = False
 
 
+# 优化、分布式、调度和算法超参数集合；ttt_length 是 EAGLE3 展开深度，DFlash block_size 是块大小。
+# 二者都涉及预测未来 token，却不能互换；不同 trainer 仅消费与自己算法相关的字段。
 @dataclass
 class TrainingConfig:
     attention_backend: str = "sdpa"
@@ -175,6 +186,8 @@ class TrainingConfig:
     dspark_confidence_head_alpha: float = 1.0
 
 
+# 训练数据生产过程中实际生成新 token 的设置，与普通只对现有 token 做 prefill 的路径分开配置。
+# weight_sync 决定是否周期性把正在训练的草稿更新到推理端。
 @dataclass
 class DecodeConfig:
     """Config for train-with-decode mode (speculative decoding during training)."""
@@ -196,6 +209,7 @@ class DecodeConfig:
     weight_sync_interval: int = 500
 
 
+# 聚合各配置段；default_factory 为每个实例建立独立子对象，避免可变默认配置跨实例共享。
 @dataclass
 class Config:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
@@ -222,6 +236,8 @@ _ALWAYS_LOCAL_PATH_KEYS = (
 _DATA_PATH_KEYS = ("dataset.train_data_path", "dataset.eval_data_path")
 
 
+# 就地解析相对路径，同时保留看起来是 Hub 数据集 ID 的名称。
+# 文件内数据路径以 YAML 目录为基准；总合并后的本地输出/cache 等路径再以工作目录为基准。
 def _resolve_relative_paths(
     config: DictConfig,
     base_dir: str,
@@ -254,6 +270,8 @@ def _resolve_relative_paths(
             OmegaConf.update(config, dotted_key, os.path.abspath(os.path.join(base_dir, expanded)))
 
 
+# 当 target_model_backend 为 vllm 时拒绝当前未接通的多模态和 decode 训练开关。
+# 注意此校验读取 target_model_backend，具体引擎选择还由 inference_engine_type 控制。
 def _validate_vllm_config(config: DictConfig) -> None:
     """Raise if the vllm backend is selected with unsupported feature flags."""
     if config.model.target_model_backend != "vllm":
@@ -267,6 +285,7 @@ def _validate_vllm_config(config: DictConfig) -> None:
             raise NotImplementedError(f"{label} is not yet supported with the vllm backend!")
 
 
+# 保留旧词表映射必须有可加载的权重来源；否则新 lm_head 的列与 token ID 对应关系没有依据。
 def _validate_vocab_mapping_config(config: DictConfig) -> None:
     """Reusing a loaded vocabulary mapping requires weights that carry one."""
     if not OmegaConf.select(config, "model.keep_initial_vocab_mapping"):
@@ -282,6 +301,7 @@ def _validate_vocab_mapping_config(config: DictConfig) -> None:
         )
 
 
+# 回放必须有数据目录和正读取引擎数，且当前不支持 decode 生成或 USP。
 def _validate_offline_config(config: DictConfig) -> None:
     if config.inference.inference_engine_type == "offline":
         if not config.inference.offline.data_path:
@@ -297,6 +317,7 @@ def _validate_offline_config(config: DictConfig) -> None:
             raise ValueError("inference.offline.num_engines must be positive")
 
 
+# micro_batch_size 至少为一，避免空 dispatch 后所有 rank 阻塞取数据，最后才表现成通信超时。
 def _validate_training_batch_config(config: DictConfig) -> None:
     if config.training.micro_batch_size < 1:
         raise ValueError(
@@ -306,6 +327,7 @@ def _validate_training_batch_config(config: DictConfig) -> None:
         )
 
 
+# 提前检查累积步数、学习率、梯度裁剪阈值为正，防止零梯度/零步数到昂贵初始化后才暴露。
 def _validate_training_numeric_config(config: DictConfig) -> None:
     """Reject non-positive values that would otherwise fail silently or crash late.
 
@@ -331,6 +353,7 @@ def _validate_training_numeric_config(config: DictConfig) -> None:
         )
 
 
+# 若配置 output_dir，将最终合并后的配置落盘作为复现实验的依据；I/O 失败仅告警。
 def _save_config_snapshot(config: DictConfig) -> None:
     """Save the resolved config to output_dir/config.yaml if output_dir is set."""
     output_dir = OmegaConf.select(config, "output_dir", default=None)
@@ -345,6 +368,8 @@ def _save_config_snapshot(config: DictConfig) -> None:
         logger.warning(f"Failed to save config to {dest}: {e}")
 
 
+# 建立有类型 schema，逐层合并并执行路径解析和校验，按需保存快照。
+# 后合并的配置覆盖前者，例如 CLI training.learning_rate 会覆盖 YAML 中的值。
 def load_config(
     config_path: Optional[str] = None,
     cli_args: Optional[list] = None,
@@ -399,9 +424,12 @@ _PREFIXED_SECTIONS = {
 }
 
 
+# 展开配置段并为后端、decode、mooncake 等加前缀，防止同名参数互相覆盖。
+# 随后派生动态 mask、日志开关、checkpoint 目录和 norm 边界；offline 从数据清单决定 norm。
 def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
     flat: dict[str, Any] = {}
 
+    # 扁平化若出现重名立即报错并指出来源；否则某段配置会静默覆盖另一段，导致运行难以解释。
     def _add(key: str, val: Any, origin: str) -> None:
         if key in flat:
             raise ValueError(f"Duplicate config key '{key}' (from '{origin}')")
@@ -460,9 +488,11 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
     return argparse.Namespace(**flat)
 
 
+# 用 OmegaConf 保存结构化配置，不额外重新派生运行参数。
 def save_config(config: DictConfig, path: str) -> None:
     OmegaConf.save(config, path)
 
 
+# 将结构化配置渲染成 YAML 打印，方便检查合并结果。
 def print_config(config: DictConfig) -> None:
     print(OmegaConf.to_yaml(config))

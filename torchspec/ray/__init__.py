@@ -17,3 +17,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+# 中文导读：Ray 基础设施包。placement_group 预留资源，ray_actor 处理进程设备，
+# train_group 批量控制训练 actor；这些概念都不等同于 PyTorch 通信组。

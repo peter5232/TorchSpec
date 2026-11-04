@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+# 通过 vLLM extract_hidden_states 与自定义 connector 采集完整 prompt 的逐层隐状态。
+# Ray 外壳处理多节点部署和请求；真正写入发生在 worker 的 connector，元数据由调度端返回。
+
 """
 VLLM Ray actor engine for distributed deployment.
 
@@ -81,6 +84,7 @@ _PER_STAGE_AUX_CAPTURE_ARCHITECTURES = frozenset(
 )
 
 
+# 封装一个请求入口或一个无前端的多节点 follower；后者同样消耗 GPU 参与 TP/PP 计算。
 class VllmEngine(InferenceEngine, RayActor):
     """Ray actor wrapper for vLLM LLM engine with distributed deployment support.
 
@@ -89,6 +93,7 @@ class VllmEngine(InferenceEngine, RayActor):
     model layers and write them directly to Mooncake.
     """
 
+    # 保存放置参数及引擎、follower executor、监视线程的空引用，为两种节点角色准备生命周期状态。
     def __init__(
         self,
         args,
@@ -112,6 +117,8 @@ class VllmEngine(InferenceEngine, RayActor):
 
         setup_file_logging("inference", self.rank, group=engine_group)
 
+    # 总 GPU 数等于 nnodes×每节点 GPU 数，除以 PP 得到 TP；不整除则拓扑无效。
+    # 例如两节点各 8 卡、PP=4，得到 TP=4；这 16 卡仍是一份模型副本。
     @staticmethod
     def _resolve_parallel_sizes(
         nnodes: int,
@@ -123,6 +130,7 @@ class VllmEngine(InferenceEngine, RayActor):
             raise ValueError(f"vLLM world_size={world_size} must be divisible by pp_size={pp_size}")
         return world_size // pp_size, pp_size
 
+    # 设置 Mooncake 环境，读取模型层数，把用户层索引转成 vLLM 捕获槽并追加最后 pre-norm 槽，再启动对应节点角色。
     def init(
         self,
         mooncake_config=None,
@@ -180,6 +188,7 @@ class VllmEngine(InferenceEngine, RayActor):
 
         from transformers import AutoConfig as _AC
 
+        # 保留外层配置用于架构支持校验，文本子配置用于层数和 H；多模态模型这两个层次可能不同。
         _outer_cfg = _AC.from_pretrained(
             self.args.target_model_path,
             trust_remote_code=getattr(self.args, "trust_remote_code", True),
@@ -195,6 +204,8 @@ class VllmEngine(InferenceEngine, RayActor):
         # [0, num_hidden_layers]; we keep ids up to num_hidden_layers
         # (the pre-`norm` slot, see final-layer block below).
         num_layers = _cfg.num_hidden_layers
+        # 例如用户选零基第 2 层的输出，vLLM 捕获槽对应 3。
+        # 这只是层索引坐标转换，不是把 token 序列向右平移一位。
         self.aux_hidden_state_layer_ids = [
             lid + 1 for lid in self.aux_hidden_state_layer_ids if lid < num_layers
         ]
@@ -208,6 +219,8 @@ class VllmEngine(InferenceEngine, RayActor):
         # (pre-norm) for target logit computation.  Index `num_hidden_layers`
         # is vllm's reserved post-last-layer / pre-`norm` slot, so training
         # can apply the model's final norm itself on top of this.
+        # 最后槽用于训练端重建目标分布，保存的是 final norm 之前的残差流。
+        # 其他后端可能已经做过 norm，消费者必须根据来源决定，不能重复归一化。
         final_layer_id = num_layers
         if final_layer_id not in self.aux_hidden_state_layer_ids:
             self.aux_hidden_state_layer_ids.append(final_layer_id)
@@ -218,6 +231,7 @@ class VllmEngine(InferenceEngine, RayActor):
                 )
 
         nnodes = getattr(self.args, "vllm_nnodes", 1)
+        # 总卡数同时被 TP 与 PP 分摊，不能独立把两者都设为总卡数。
         tp_size, pp_size = self._resolve_parallel_sizes(
             nnodes,
             self.num_gpus_per_engine,
@@ -238,6 +252,7 @@ class VllmEngine(InferenceEngine, RayActor):
 
         # Only node_rank=0 owns the LLM front end.  Follower nodes run vLLM's
         # headless MultiprocExecutor and therefore do not expose an LLM object.
+        # follower 无 LLM 前端，不应访问不存在的前端对象；从已加载的配置取得同一 H。
         self._hidden_size = (
             _cfg.hidden_size
             if nnodes > 1 and self.node_rank > 0
@@ -249,6 +264,7 @@ class VllmEngine(InferenceEngine, RayActor):
             f"(tp_size={tp_size}, aux_layers={self.aux_hidden_state_layer_ids}, hidden_size={self._hidden_size})"
         )
 
+    # 限制子进程可见 GPU，配置捕获 connector、关闭前缀缓存并预留提取临时显存；只有头节点创建 LLM。
     def _init_engine(
         self,
         tp_size: int,
@@ -269,6 +285,7 @@ class VllmEngine(InferenceEngine, RayActor):
                 f"VllmEngine rank {self.rank}: set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
             )
 
+        # extract_hidden_states 决定捕获模型输出，kv_transfer_config 决定由哪个 connector 发布；两者缺一不可。
         engine_kwargs = {
             "model": self.args.target_model_path,
             "tensor_parallel_size": tp_size,
@@ -318,6 +335,7 @@ class VllmEngine(InferenceEngine, RayActor):
                     f"max_num_seqs={inference_batch_size} from inference_batch_size"
                 )
 
+        # 完整训练样本需要每个 token 的辅助层，不能仅计算未命中缓存的后缀。
         engine_kwargs["enable_prefix_caching"] = False
 
         # Prefill-only: no decode graphs needed and piecewise adds launch
@@ -354,6 +372,7 @@ class VllmEngine(InferenceEngine, RayActor):
             engine_kwargs["nnodes"] = nnodes
             engine_kwargs["node_rank"] = self.node_rank
 
+        # 用户显式利用率优先；自动估算为 connector 运行时临时张量留空间，这部分不一定被后端启动 profiler 计入。
         if mem_fraction is not None:
             engine_kwargs["gpu_memory_utilization"] = mem_fraction
         else:
@@ -362,6 +381,7 @@ class VllmEngine(InferenceEngine, RayActor):
             # save_kv_layer).  Auto-compute a utilization that reserves room.
             engine_kwargs["gpu_memory_utilization"] = self._compute_mem_fraction(engine_kwargs)
 
+        # 一个跨节点副本只能有一个调度前端；其他节点进入 follower 协议并等待 head 下发工作。
         if nnodes > 1 and self.node_rank > 0:
             self._init_headless_executor(engine_kwargs)
             logger.info(
@@ -377,6 +397,7 @@ class VllmEngine(InferenceEngine, RayActor):
                 f"with layers={self.aux_hidden_state_layer_ids}"
             )
 
+    # PP 要求每个阶段都返回其拥有的辅助层；只放行已支持这种返回契约的架构，避免训练永远等待缺失层。
     @staticmethod
     def _check_per_stage_capture_support(pp_size: int, architectures: list[str] | None) -> None:
         """Reject pipeline parallelism for targets that cannot capture per stage.
@@ -410,6 +431,7 @@ class VllmEngine(InferenceEngine, RayActor):
                 f"_PER_STAGE_AUX_CAPTURE_ARCHITECTURES. Supported: {supported}"
             )
 
+    # follower 仅启动 MultiprocExecutor 和监视线程；若每节点都造 LLM，会重复建立调度端并破坏控制通信。
     def _init_headless_executor(self, engine_kwargs: dict) -> None:
         """Start the vLLM MP follower protocol without creating an LLM front end.
 
@@ -455,6 +477,8 @@ class VllmEngine(InferenceEngine, RayActor):
     _VLLM_DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
     _HEADLESS_MONITOR_JOIN_TIMEOUT_S = 30.0
 
+    # 用最大序列长度×捕获层数×H×2 字节估算一次提取，再乘二作余量，从默认 0.9 扣除且不低于 0.4。
+    # 这是静态估算，不是针对所有并发请求的严格内存上界；显式配置利用率时不会走这里。
     def _compute_mem_fraction(self, engine_kwargs: dict) -> float:
         """Auto-compute gpu_memory_utilization with connector overhead reserved.
 
@@ -496,6 +520,8 @@ class VllmEngine(InferenceEngine, RayActor):
         )
         return adjusted
 
+    # 构建 vLLM 请求并触发捕获，随后把 kv_transfer_params 中的键、逐层清单和原 loss mask 转回训练协议。
+    # 仅生成一个 token 以完成后端请求，但本连接器存储的是 prompt 序列；缺失连接器元数据时跳过结果。
     def generate(
         self,
         data_id: str | list[str],
@@ -533,6 +559,7 @@ class VllmEngine(InferenceEngine, RayActor):
                 raise ValueError("input_ids_ref resolved to None")
             batch_size = len(input_ids_list)
 
+        # 把文本/token/媒体规范成每请求字典，避免不同输入格式分叉成不同发布协议。
         prompts = self._build_prompts(
             formatted_prompts=formatted_prompts if use_prompts else None,
             input_ids_list=input_ids_list,
@@ -551,6 +578,7 @@ class VllmEngine(InferenceEngine, RayActor):
 
         from vllm import SamplingParams
 
+        # 一个输出 token 触发完整请求结束和 connector 发布；训练层清单仍根据 prompt 长度生成。
         sampling_params = SamplingParams(max_tokens=1, temperature=0)
 
         # Build packed_loss_mask_map for result assembly
@@ -567,6 +595,7 @@ class VllmEngine(InferenceEngine, RayActor):
             seq_len = len(output.prompt_token_ids)
             did = data_ids[i]
 
+            # 元数据由 connector 调度端预先生成并随 RequestOutput 回传；这里不直接访问 worker 缓存。
             kv_params = getattr(output, "kv_transfer_params", None)
             if kv_params is None:
                 logger.error(
@@ -586,6 +615,7 @@ class VllmEngine(InferenceEngine, RayActor):
                 "data_id": did,
                 "seq_len": seq_len,
             }
+            # 清单使训练端知道需要读取哪些层对象；即使单 PP 阶段也可沿用同一逐层协议。
             pp_layer_manifest = kv_params.get("pp_layer_manifest")
             if pp_layer_manifest is not None:
                 result["metadata"] = {
@@ -597,6 +627,7 @@ class VllmEngine(InferenceEngine, RayActor):
             if packed_loss_mask is not None:
                 result["packed_loss_mask"] = packed_loss_mask
 
+            # 顺带返回 token 的小型 CPU 列表，供消费者构建 mask 等操作，避免额外 GPU→CPU 同步。
             input_ids_from_kv = kv_params.get("input_ids_list")
             if input_ids_from_kv is not None:
                 result["input_ids_list"] = input_ids_from_kv
@@ -611,6 +642,7 @@ class VllmEngine(InferenceEngine, RayActor):
         )
         return results
 
+    # 统一单样本 [1, S] 和 [S]，其他维度明确拒绝，避免列表转换后丢失样本边界。
     def _normalize_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         if input_ids.dim() == 2 and input_ids.shape[0] == 1:
             return input_ids.squeeze(0)
@@ -618,6 +650,7 @@ class VllmEngine(InferenceEngine, RayActor):
             return input_ids
         raise ValueError(f"Unexpected input_ids shape: {input_ids.shape}")
 
+    # 逐项过滤 None；字符串通过后端加载函数解析，已经加载好的媒体对象直接保留。
     @staticmethod
     def _resolve_media(items: list, fetch_fn) -> list:
         """Resolve URL strings to loaded objects via *fetch_fn*, drop None entries."""
@@ -631,6 +664,7 @@ class VllmEngine(InferenceEngine, RayActor):
                 resolved.append(item)
         return resolved
 
+    # 将 images/videos 转为 vLLM 的 image/video 字段；单个媒体折成对象，多个保留列表，并兼容缺少视频加载工具的环境。
     @staticmethod
     def _to_vllm_multi_modal_data(mm_input: dict | None) -> dict | None:
         """Convert TorchSpec multimodal payload to vLLM ``multi_modal_data``.
@@ -665,6 +699,7 @@ class VllmEngine(InferenceEngine, RayActor):
                 mm_data["video"] = loaded[0] if len(loaded) == 1 else loaded
         return mm_data or None
 
+    # 按批次位置组装文本或 token 字典并附加对应媒体；先校验媒体列表长度以防样本错配。
     def _build_prompts(
         self,
         formatted_prompts: list[str] | None,
@@ -696,11 +731,13 @@ class VllmEngine(InferenceEngine, RayActor):
             prompts.append(prompt_dict)
         return prompts
 
+    # 前端 LLM 或 follower executor 任一存在即算就绪；follower 没有 LLM 是正常部署状态。
     def health_check(self, timeout: float = 5.0) -> bool:
         # A follower node owns a headless executor instead of an LLM front end,
         # so it is live without ``_engine``.
         return self._engine is not None or self._headless_executor is not None
 
+    # 先关闭 follower，再按可用版本接口关闭前端；最终释放引用和 CUDA 空闲缓存，错误只记录日志。
     def shutdown(self) -> None:
         self._shutdown_headless_executor()
 
@@ -725,6 +762,7 @@ class VllmEngine(InferenceEngine, RayActor):
 
         logger.info(f"VllmEngine rank {self.rank}: shutdown complete")
 
+    # 关闭 follower 子进程并限时等待监视线程退出，避免无 LLM 的节点在清理时遗漏 GPU 占用。
     def _shutdown_headless_executor(self) -> None:
         """Tear down a follower node's executor and its worker processes.
 
@@ -754,6 +792,7 @@ class VllmEngine(InferenceEngine, RayActor):
                 )
             self._headless_monitor_thread = None
 
+    # 返回前端初始化标志及模型维度；注意 initialized 只看 _engine，与兼容 follower 的 health_check 判据不同。
     def get_status(self) -> dict:
         return {
             "rank": self.rank,
@@ -762,6 +801,7 @@ class VllmEngine(InferenceEngine, RayActor):
             "hidden_size": self._hidden_size,
         }
 
+    # 从目标模型配置的顶层或嵌套文本配置读取 H；缺失时失败，不能构造错误字节长度。
     def _get_hidden_size_from_engine(self) -> int:
         from transformers import AutoConfig
 

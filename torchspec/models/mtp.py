@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 批优先训练张量与 Megatron 原生 MTP 的序列优先接口之间的适配。
+# 冻结 embedding/head 不等于冻结 MTP：MTP 层仍通过隐藏态学习未来 token 的预测。
 """Batch-first PyTorch wrapper around a native Megatron MTP layer."""
 
 from __future__ import annotations
@@ -31,10 +33,12 @@ import torch.nn as nn
 class SequenceFirstEmbedding(nn.Module):
     """Adapt an ``nn.Embedding`` to the keyword, sequence-first call Megatron makes."""
 
+    # 保存已有 embedding 模块引用，避免重新分配或复制词表参数。
     def __init__(self, embedding: nn.Embedding):
         super().__init__()
         self.embedding = embedding
 
+    # 查表得 [B,S,H]，转成连续 [S,B,H] 供 Megatron；position_ids 不影响 token embedding。
     def forward(self, *, input_ids: torch.Tensor, position_ids=None) -> torch.Tensor:
         return self.embedding(input_ids).transpose(0, 1).contiguous()
 
@@ -46,6 +50,7 @@ class MegatronMTPModel(nn.Module):
     ``compute_logits`` and its own objective.
     """
 
+    # 持有 MTP 层和 RoPE，冻结共享 embedding/head；loss 的选择留给训练调用方。
     def __init__(
         self,
         *,
@@ -60,9 +65,12 @@ class MegatronMTPModel(nn.Module):
         self.lm_head = lm_head.requires_grad_(False)
         self.rotary_embedding = rotary_embedding
 
+    # 将 MTP 输出直接送冻结 LM head，保留对 hidden_states 的梯度，得到 [B,S,V]。
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
 
+    # 校验 token 与 hidden 的 [B,S] 对齐，转 [S,B,H] 后交给原生 MTP，再转回。
+    # 原生层把 hidden[t] 与 token[t+1] 的 embedding 结合；最后一行卷回 token 必须由上游 loss mask 排除。
     def forward(
         self,
         *,

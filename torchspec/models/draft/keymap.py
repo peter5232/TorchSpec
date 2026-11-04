@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 训练内部参数名与 HF/vLLM/SGLang 导出键之间的双向转换。
+# 这里只改字典键，不改张量；不同模型家族的 norm 键可能重叠，逆映射需要目标模型键集合。
 """
 Mapping TorchSpec weight keys to HF / vLLM / SGLang serving names.
 """
@@ -32,6 +34,7 @@ DRAFT_WEIGHT_KEY_REMAP = [
 ]
 
 
+# 依次匹配内部前缀并替换第一个命中项，如 midlayer.→layers.0.；未知键原样保留。
 def to_export_keys(tensors: dict) -> dict:
     """Rename internal draft keys to HF/SGLang export names (forward direction)."""
     remapped = {}
@@ -45,6 +48,8 @@ def to_export_keys(tensors: dict) -> dict:
     return remapped
 
 
+# 先保留目标模型已认识的键，仅对未知键尝试反向前缀，并确认候选确实存在。
+# 例如 EAGLE3 自有 norm.weight 不能被误改成 DFlash 的 final_norm.weight。
 def to_internal_keys(tensors: dict, model_keys: Collection[str]) -> dict:
     """Rename exported draft keys back to internal names (reverse direction).
 

@@ -18,6 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：评估使用固定 teacher 特征缓存，避免每次评估都重复运行昂贵目标模型。
+# 构建缓存仍经过同一推理→Mooncake→训练端链路，但有独立队列并按小块推进。
+# 这里记录的 simulated_acc_len 是训练评估指标；不能直接当成部署引擎测得的加速倍数。
+
 """Eval-specific setup and runtime helpers for the controller loop."""
 
 import hashlib
@@ -37,6 +41,7 @@ from torchspec.utils.logging import logger
 EVAL_CACHE_IDLE_TIMEOUT = 300.0
 
 
+# 封装评估调度状态：是否启用、缓存路径/命中、历史最好分数和已提交的首块数量。
 @dataclass
 class EvalSetupState:
     eval_interval: int
@@ -50,6 +55,7 @@ class EvalSetupState:
     initial_eval_submit_count: int = 0
 
 
+# 按“距上次实际进展”计超时，而非评估总用时；长任务只要持续收到数据就不会被误判停滞。
 def _check_idle_timeout(
     dispatched_samples: int, last_progress_at: float, total_samples: int
 ) -> None:
@@ -63,6 +69,8 @@ def _check_idle_timeout(
         )
 
 
+# 将评估结果写入已有 checkpoint 元数据，并按 simulated_acc_len 更新最佳指示文件。
+# 这里用 step+1 构造目录编号，是与 checkpoint 保存侧配对的约定；阅读时不要擅自改成 step。
 def update_checkpoint_eval_meta(
     checkpoint_dir: str | None,
     step: int,
@@ -97,6 +105,8 @@ def update_checkpoint_eval_meta(
     return current_best
 
 
+# 每分发一批就让训练组取走并缓存，再提交下一小块输入，形成有界的生产消费节奏。
+# 若迟迟凑不齐批次则做空闲超时检查；全部处理后清理控制器评估状态并异步落盘缓存。
 def generate_eval_cache(
     controller,
     train_group,
@@ -114,6 +124,8 @@ def generate_eval_cache(
         f"({eval_dataset_size} samples, dispatch_bs={dispatch_bs})..."
     )
     dispatched_samples = 0
+    # 初始已经提交一小段评估输入；每消费一个 dispatch 再补一个，形成有限窗口。
+    # 这样即使验证集很大，也不需要全部 hidden states 同时留在 Mooncake。
     next_submit_idx = eval_state.initial_eval_submit_count
     eval_progress = tqdm(total=eval_dataset_size, desc="Eval caching", unit="sample")
 
@@ -141,6 +153,7 @@ def generate_eval_cache(
         logger.info(f"Eval cache save started (async) to {eval_cache_path}")
 
 
+# 从训练端缓存执行评估，取 rank 0 已汇总的结果写日志；未启用时返回空字典。
 def run_eval(step: int, train_group, eval_enabled: bool) -> dict:
     """Run forward-only eval from cache. Assumes eval cache is already populated."""
     if not eval_enabled:
@@ -160,6 +173,9 @@ def run_eval(step: int, train_group, eval_enabled: bool) -> dict:
     return eval_metrics
 
 
+# 结合验证集大小、历史最佳元数据和缓存路径准备评估状态。
+# 缓存 key 包含数据源、目标模型路径、最大长度和辅助层列表，不是完整配置/权重内容哈希。
+# 所有 rank 都成功加载缓存才算命中，否则先提交有限数量的验证输入等待构建。
 def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSetupState:
     """Prepare eval runtime settings and optionally load/submit eval cache input."""
     eval_interval = args.eval_interval
@@ -200,6 +216,8 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
         eval_cache_path = os.path.join(cache_dir, "eval_cache", cache_key)
 
         loaded = train_group.load_eval_cache(eval_cache_path)
+        # 评估是分布式操作：只有所有 rank 都有缓存才算整体命中。
+        # 单个 rank 缺缓存不能直接开始评估，否则各 rank 输入步数不同可能卡在聚合。
         if all(n > 0 for n in loaded):
             eval_cache_loaded = True
             logger.info(

@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Qwen3.5 MoE MTP 的 Megatron 构造与 HF 权重导入。
+# 主要难点是 Q/gate/K/V 的分组布局、RMSNorm 的 gamma-1 存储和专家并行所有权，而非普通同名 load_state_dict。
 """Qwen3.5 MoE MTP on Megatron-Core: construction and Hugging Face checkpoint import."""
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ class Qwen35MTPConfig:
     partial_rotary_factor: float
     attention_output_gate: bool
 
+    # 从外层或 text_config 提取模型维度和 RoPE 字段，验证 Q 头数整除 KV 头数以支持 GQA 分组。
     @classmethod
     def from_dict(cls, raw_config: Mapping[str, Any]) -> "Qwen35MTPConfig":
         config = raw_config.get("text_config", raw_config)
@@ -78,11 +81,14 @@ class Qwen35MTPConfig:
             raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
         return result
 
+    # 读取 JSON 后复用字典解析，保持文件和程序配置的类型转换/约束一致。
     @classmethod
     def from_json_file(cls, path: Union[str, Path]) -> "Qwen35MTPConfig":
         return cls.from_dict(json.loads(Path(path).read_text()))
 
 
+# 校验 Megatron 版本与专家数可整除 EP，构造单层原生 MTP+MoE；TP 固定 1，专家分发用 alltoall。
+# 路由只对 top-k logits softmax，对应 Qwen 全 softmax→top-k→重归一化；关闭额外负载平衡 loss。
 def build_qwen35_mtp_model(
     config: Qwen35MTPConfig, groups, *, dtype: torch.dtype = torch.float32
 ) -> MegatronMTPModel:
@@ -98,6 +104,7 @@ def build_qwen35_mtp_model(
     ep_size = dist.get_world_size(groups.ep)
     if config.num_experts % ep_size:
         raise ValueError(f"num_experts={config.num_experts} is not divisible by EP={ep_size}")
+    # 阶段一：把 HF 的模型维度显式翻译成 Megatron TransformerConfig，避免两库默认值不一致。
     core_config = TransformerConfig(
         num_layers=1,
         mtp_num_layers=1,
@@ -109,6 +116,7 @@ def build_qwen35_mtp_model(
         ffn_hidden_size=config.moe_intermediate_size,
         moe_ffn_hidden_size=config.moe_intermediate_size,
         num_moe_experts=config.num_experts,
+        # 每 token 选 k 个专家后对所选分数归一化；router 的 FP32 有助于保持离散 top-k 选择的数值稳定。
         moe_router_topk=config.num_experts_per_tok,
         # Softmax over the top-k logits equals Qwen's softmax -> top-k -> renormalize.
         moe_router_score_function="softmax",
@@ -129,6 +137,7 @@ def build_qwen35_mtp_model(
         add_bias_linear=False,
         attention_dropout=0.0,
         hidden_dropout=0.0,
+        # 当前构造把稀疏专家分到 EP rank，未同时启用 attention/专家内部 TP；这些并行概念不应混为一项。
         tensor_model_parallel_size=1,
         expert_tensor_parallel_size=1,
         expert_model_parallel_size=ep_size,
@@ -136,6 +145,7 @@ def build_qwen35_mtp_model(
         params_dtype=dtype,
         use_cpu_initialization=not torch.cuda.is_available(),
     )
+    # 阶段二：使用原生 local spec 构造真实 MTP 模块，随后权重导入按其参数结构映射，不模拟一个近似 PyTorch 层。
     layer_spec = get_gpt_layer_local_spec(
         num_experts=config.num_experts, qk_layernorm=True, normalization="RMSNorm"
     )
@@ -148,6 +158,7 @@ def build_qwen35_mtp_model(
     # Standalone construction does not propagate the layer number to the router.
     mtp_layer.mtp_model_layer.mlp.set_layer_number(1)
 
+    # 阶段三：配置冻结的 embedding/head 容器和部分旋转 RoPE，输出包装为 batch-first 训练接口。
     model = MegatronMTPModel(
         mtp_layer=mtp_layer,
         embedding=torch.nn.Embedding(config.vocab_size, config.hidden_size),
@@ -166,6 +177,8 @@ def build_qwen35_mtp_model(
     return model.to(dtype=dtype)
 
 
+# HF 的每头 [query,gate] 行改排为每 KV 组 [本组所有 Q,本组所有 gate,K,V]。
+# 例如 4 个 Q 头/2 个 KV 头，组0拼 Q0,Q1,G0,G1,K0,V0，组1再同样拼，不能简单 cat(q,k,v)。
 def pack_qwen35_qkv(
     q_proj: torch.Tensor,
     k_proj: torch.Tensor,
@@ -199,6 +212,8 @@ def pack_qwen35_qkv(
     return torch.cat(blocks).reshape(-1, hidden_size)
 
 
+# 先将全部参数填 NaN，再逐项加载 embedding/head、norm、attention 和本 rank 专家，记录映射报告。
+# 最终检查每个目的参数均已加载且有限、所有相关源键均被消费；其他 EP rank 的专家键可合法跳过。
 @torch.no_grad()
 def load_qwen35_mtp_weights(
     model: MegatronMTPModel, config: Qwen35MTPConfig, checkpoint_dir: Union[str, Path]
@@ -215,6 +230,7 @@ def load_qwen35_mtp_weights(
     weight_map = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
     handles: dict[str, Any] = {}
 
+    # 按索引找到分片并缓存 safe_open handle，重复读同分片多个 key 时复用文件入口。
     def read(key: str) -> torch.Tensor:
         filename = weight_map[key]
         if filename not in handles:
@@ -225,7 +241,9 @@ def load_qwen35_mtp_weights(
     transformer = layer.mtp_model_layer
     attention = transformer.self_attention
     moe = transformer.mlp
+    # 目的参数用对象 id 映射到路径，报告即使跨多层封装也能指出实际写入了哪一个 Parameter。
     names = {id(p): name for name, p in model.named_parameters()}
+    # NaN 是加载覆盖率哨兵：若遗漏任何目的参数，末尾 isfinite 检查可识别，而随机初值会掩盖遗漏。
     for parameter in model.parameters():
         parameter.fill_(float("nan"))
 
@@ -233,10 +251,13 @@ def load_qwen35_mtp_weights(
     ep_rank = dist.get_rank(moe.ep_group)
     entries: list[dict[str, Any]] = []
 
+    # 按 transform 执行恒等、norm+1、gate/up 拼接或 grouped QKV 重排，形状匹配后才 copy。
+    # 记录源/目标形状 dtype、所属 rank 和转换后误差，支持核对复杂 checkpoint 导入。
     def load(parameter, keys, transform="identity"):
         tensors = [read(key) for key in keys]
         if transform == "identity":
             value = tensors[0]
+        # HF Qwen 存的是 delta=gamma-1，而 Megatron 存 gamma；遗漏 +1 会改变全部归一化层缩放。
         elif transform == "rmsnorm_one_plus_delta":  # Qwen RMSNorm stores gamma - 1
             value = tensors[0].float() + 1.0
         elif transform == "concat_gate_up":
@@ -269,6 +290,7 @@ def load_qwen35_mtp_weights(
             }
         )
 
+    # 共享 embedding/head 与 MTP 内部参数分开加载；MTP 的 embedding/hidden norm 都要执行 Qwen 的 +1 转换。
     norm = "rmsnorm_one_plus_delta"
     attn = "mtp.layers.0.self_attn."
     load(model.embedding.embedding.weight, ["model.language_model.embed_tokens.weight"])
@@ -285,6 +307,7 @@ def load_qwen35_mtp_weights(
         transformer.pre_mlp_layernorm.weight, ["mtp.layers.0.post_attention_layernorm.weight"], norm
     )
     load(moe.router.weight, ["mtp.layers.0.mlp.gate.weight"])
+    # 只加载当前 EP rank 所有的专家，源键仍用全局 expert_index，目的列表用 local_index。
     for local_index, expert_index in enumerate(moe.local_expert_indices):
         expert = moe.experts.local_experts[local_index]
         prefix = f"{_EXPERT_PREFIX}{expert_index}."
@@ -306,6 +329,7 @@ def load_qwen35_mtp_weights(
     load(layer.final_layernorm.weight, ["mtp.norm.weight"], norm)
 
     local_experts = {int(i) for i in moe.local_expert_indices}
+    # 源键消费集合检查与目的参数覆盖检查互补：前者抓漏读的 checkpoint 内容，后者抓未初始化的模型参数。
     consumed = {key for entry in entries for key in entry["source"]}
     required = {k for k in weight_map if k.startswith("mtp.")}
     required |= {"model.language_model.embed_tokens.weight", "lm_head.weight"}
@@ -318,6 +342,7 @@ def load_qwen35_mtp_weights(
             unexpected.append(key)
     missing = sorted(set(names.values()) - {entry["destination"] for entry in entries})
     nonfinite = sorted(name for name, p in model.named_parameters() if not p.isfinite().all())
+    # 三类错误任一出现都拒绝完成导入，避免 checkpoint 看似成功但部分参数仍随机或布局错误。
     if unexpected or missing or nonfinite:
         raise RuntimeError(
             f"MTP import failed: unexpected={unexpected}, missing={missing}, nonfinite={nonfinite}"

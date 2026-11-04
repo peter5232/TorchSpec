@@ -18,6 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：在线数据入口，将对话变成 InferenceInput 所需字段；此时尚未运行目标模型。
+# 三种输入契约：原始消息先格式化+分词；延迟分词只传格式化文本；预分词数据直接校验 ID/mask。
+# loss_mask 表示哪些 token 参与监督，不等于 attention_mask（哪些 token 是有效上下文）。
+# 多模态占位符经引擎展开后长度会改变，因此旧 mask 必须丢弃并以实际 token 流重算。
+
 import contextlib
 import hashlib
 import logging as _logging
@@ -68,6 +73,7 @@ _PRETOKENIZED_CONTRACT_COLUMNS = frozenset(
 )
 
 
+# 依据列 schema 同时识别 input_ids 和 mask；只出现其中之一就报错，避免把不完整预分词数据当原始对话。
 def _is_pretokenized_dataset(dataset) -> bool:
     """Return whether an HF dataset exposes the offline token/mask contract."""
     columns = set(getattr(dataset, "column_names", None) or ())
@@ -81,6 +87,7 @@ def _is_pretokenized_dataset(dataset) -> bool:
     return has_ids
 
 
+# 保留调用方自定义的标量溯源字段，过滤张量/列表等大对象，防止它们长期留在控制器内存。
 def _pretokenized_metadata(sample) -> dict:
     """Carry through the row's own provenance columns untouched.
 
@@ -99,6 +106,9 @@ def _pretokenized_metadata(sample) -> dict:
     }
 
 
+# 逐条检查 ID 整数列表、长度、监督段总长、非空监督和 ID 唯一性，不再套聊天模板。
+# 例如 5 个 ID 的 packed mask 必须恰好覆盖 5 个位置；若同时带完整 mask，两种表示必须逐项一致。
+# 超长直接拒绝而非截断，保持离线生产方定义的监督范围不被悄悄改变。
 def _load_pretokenized_dataset(dataset, *, max_length: int, total=None):
     """Load already-rendered rows without applying a chat template again."""
     prompts = []
@@ -134,6 +144,8 @@ def _load_pretokenized_dataset(dataset, *, max_length: int, total=None):
             packed_loss_mask = serialize_packed_loss_mask(
                 pack_loss_mask(torch.tensor(explicit_loss_mask, dtype=torch.long))
             )
+        # 段长的总和必须等于 ID 长度。比如 6 个 ID 配 "2,3,1"：前 2 个不监督、接着 3 个监督、末 1 个不监督。
+        # 校验计数及两种 mask 编码的一致性，避免文件看似可加载但 token 目标已经错位。
         segments = deserialize_packed_loss_mask(packed_loss_mask)
         if any(length < 0 for length in segments) or sum(segments) != len(input_ids):
             raise ValueError(
@@ -175,6 +187,7 @@ def _load_pretokenized_dataset(dataset, *, max_length: int, total=None):
     return prompts
 
 
+# 每个 CPU worker 只加载一次 tokenizer 和 parser/renderer，避免每条样本重复初始化。
 def _init_tokenize_worker(
     tokenizer_path,
     trust_remote_code,
@@ -198,6 +211,7 @@ def _init_tokenize_worker(
     _worker_state["min_loss_tokens"] = min_loss_tokens
 
 
+# auto 模式在原始消息中检测真实思考内容，再决定是否只监督最后一轮；显式布尔值直接遵从。
 def _resolve_last_turn_loss_only(messages):
     ltlo = _worker_state.get("last_turn_loss_only", False)
     if ltlo == "auto":
@@ -205,6 +219,7 @@ def _resolve_last_turn_loss_only(messages):
     return bool(ltlo)
 
 
+# 把 auto 的决定编码为 has_thinking 元数据；后续媒体展开导致 mask 重建时仍能复用同一监督策略。
 def _auto_decision_metadata(last_turn_only: bool) -> dict:
     """Record a resolved "auto" decision so training can reapply it.
 
@@ -217,6 +232,8 @@ def _auto_decision_metadata(last_turn_only: bool) -> dict:
     return {"has_thinking": last_turn_only}
 
 
+# 处理一条消息列表，产出 ID、紧凑 mask 和可选格式化文本；监督 token 不足则过滤。
+# 跨 CPU 进程返回 NumPy 数组而不是每 token 一个 Python int 或 torch 共享内存句柄，降低 IPC 对象开销。
 def _tokenize_single(args):
     """Worker function — tokenize one sample."""
     messages, tools, generation_config, max_length, train_with_decode = args
@@ -273,6 +290,7 @@ def _tokenize_single(args):
     }
 
 
+# 延迟分词仍需加载 tokenizer 供聊天模板渲染，只是不在这里对整条文本编码；原函数总说明中的 no tokenizer 并非当前实际行为。
 def _init_format_worker(
     tokenizer_path, trust_remote_code, chat_template_name, last_turn_loss_only=False
 ):
@@ -283,6 +301,7 @@ def _init_format_worker(
     _worker_state["last_turn_loss_only"] = last_turn_loss_only
 
 
+# 只规范化消息和渲染文本，不扩展媒体占位符；引擎之后决定实际 ID 与视觉 token 数量。
 def _format_single(args):
     """
     Worker function — format only, skip tokenization.
@@ -302,6 +321,7 @@ def _format_single(args):
     return result
 
 
+# 动态 mask 模式下移除多模态的旧 mask；若旧缓存缺失 auto 决策元数据则报错，避免猜测监督范围。
 def _drop_stale_multimodal_masks(
     prompts, dynamic_loss_mask: bool, last_turn_loss_only=False
 ) -> None:
@@ -328,6 +348,9 @@ def _drop_stale_multimodal_masks(
             )
 
 
+# 加载数据、优先检测预分词契约，再选择 renderer 或模板并构建缓存 key。
+# 原始对话分两遍处理：先提取消息/媒体，再并行格式化或分词，最后还原成带 data_id 的条目。
+# 多进程池在收集大语料前创建，减少 fork 后写时复制的内存压力；缓存键包含渲染版本和监督选项。
 def load_conversation_dataset(args):
     """Load conversation dataset and optionally tokenize for training.
 
@@ -372,6 +395,8 @@ def load_conversation_dataset(args):
     # pretokenized corpus is never rendered, so a config that sets neither is
     # complete rather than under-specified. The checks above are decidable from
     # the config alone and stay there.
+    # schema 提前识别出 ID+mask 时直接走校验并 return，不要求 renderer/chat_template。
+    # 否则对已格式化过的 token 再套一次模板，会重复角色头并改变所有监督位置。
     if _is_pretokenized_dataset(hf_dataset):
         if defer_tokenization:
             raise ValueError("Pretokenized datasets require defer_tokenization=False")
@@ -398,6 +423,8 @@ def load_conversation_dataset(args):
     train_with_decode = getattr(args, "train_with_decode", False)
     min_loss_tokens_val = getattr(args, "min_loss_tokens", 0)
     renderer_version = RENDERER_REGISTRY.cache_version(renderer_name) if renderer_name else None
+    # 缓存 key 同时包含语料位置、模型、最大长度、模板/renderer 版本和监督策略。
+    # 这些因素改变时通常应重新生成 ID/mask；本地单文件还纳入大小/修改时间，但这不是完整内容哈希。
     cache_params = (
         f"{dataset_name}-{args.train_data_path}{file_stat}-{args.target_model_path}"
         f"-{max_length}-template={chat_template_name}-renderer={renderer_name}"
@@ -411,6 +438,8 @@ def load_conversation_dataset(args):
 
     dynamic_loss_mask = getattr(args, "dynamic_loss_mask", False)
 
+    # 命中缓存节省的是格式化/分词成本；它不是目标 hidden states 缓存。
+    # 仍需处理媒体展开后的旧 mask 问题，不能因为缓存存在就跳过语义检查。
     if os.path.exists(cache_path):
         logger.info(f"Loading dataset from cache: {cache_path}")
         prompts = torch.load(cache_path, weights_only=False)
@@ -430,6 +459,8 @@ def load_conversation_dataset(args):
 
     last_turn_loss_only = getattr(args, "last_turn_loss_only", False)
     if defer_tokenization:
+        # 延迟模式仍加载用于聊天模板的 tokenizer；只是把整段 tokenization 留给引擎。
+        # 因此这里省掉的是本地编码与提前定义 token 位置，不是所有 tokenizer 初始化成本。
         worker_init = _init_format_worker
         worker_initargs = (args.target_model_path, True, chat_template_name, last_turn_loss_only)
         worker_fn = _format_single
@@ -459,6 +490,8 @@ def load_conversation_dataset(args):
         worker_init(*worker_initargs)
         pool_ctx = contextlib.nullcontext()
     else:
+        # 在收集 raw_samples 前创建池，使支持 fork 的环境不把已装入的大语料一起继承给 worker。
+        # Python 引用计数更新会弄脏共享页；“fork 是写时复制”并不保证读遍大对象时没有内存膨胀。
         pool_ctx = mp.Pool(num_proc, initializer=worker_init, initargs=worker_initargs)
 
     with pool_ctx as pool:
@@ -475,6 +508,8 @@ def load_conversation_dataset(args):
                 )
 
             messages = _normalize_conversation(raw_prompt)
+            # 必须先提取结构化媒体引用，再将 content 展平为占位符文本；顺序颠倒会丢失图片地址。
+            # 保留媒体与 tokenized 文本两种表示，让推理引擎后续执行自己的视觉预处理。
             multimodal_inputs = extract_media_urls(messages)
             if custom_template is not None:
                 flatten_multimodal_content(messages, custom_template.image_placeholder)
@@ -494,6 +529,8 @@ def load_conversation_dataset(args):
         )
 
         # Pass 2: process in parallel
+        # 提交 CPU 预处理所需的消息、工具、样本生成配置和长度；媒体引用保留在主进程条目中。
+        # 这里是 CPU 数据并行，不是 GPU DP/SP，也不会触发模型梯度通信。
         work_items = [
             (messages, tools, generation_config, max_length, train_with_decode)
             for _, messages, _, tools, generation_config in raw_samples
@@ -504,6 +541,8 @@ def load_conversation_dataset(args):
         else:
             results = list(
                 tqdm(
+                    # imap 保持输入次序，使下方 zip(raw_samples, results) 仍能按位置配回原 data_id。
+                    # 若改成无序返回，就必须显式带回 ID，否则结果形状可能正常但对应了另一条样本。
                     pool.imap(worker_fn, work_items, chunksize=64),
                     total=len(work_items),
                     desc=desc,
@@ -515,6 +554,8 @@ def load_conversation_dataset(args):
     skipped = 0
     unbalanced_think = 0
     for (data_id, _, multimodal_inputs, _, _), result in zip(raw_samples, results):
+        # 被 worker 判为空/监督不足的原始样本在训练开始前就过滤。
+        # 这与训练 rank 已经同步取到样本后再丢弃不同：后者可能破坏 collective 次数，需要 neutralize。
         if result is None:
             skipped += 1
             continue
@@ -537,6 +578,8 @@ def load_conversation_dataset(args):
         }
 
         if not defer_tokenization:
+            # worker 回传的 NumPy 字节缓冲可直接包装成 tensor，减少逐 token Python 对象重建。
+            # 纯文本可沿用原 mask；图片展开数量由引擎决定，不能沿用预展开时的序列位置。
             entry["input_ids"] = torch.from_numpy(result["input_ids"])
             if multimodal_inputs is None:
                 entry["packed_loss_mask"] = result["packed_loss_mask"]
@@ -567,6 +610,8 @@ def load_conversation_dataset(args):
         )
 
     os.makedirs(cache_dir, exist_ok=True)
+    # 缓存只保存预处理条目，下一次训练仍需推理生产 teacher 特征（除非选择 offline 回放）。
+    # 注意该写入不是临时文件+原子替换；不要据此假定并发作业共享缓存写入具备事务保证。
     torch.save(prompts, cache_path)
     logger.info(f"Saved {len(prompts)} samples to cache: {cache_path}")
 

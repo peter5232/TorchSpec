@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# EAGLE4 的稀疏 FFN 与服务权重布局。路由选择使用带偏置 sigmoid 分数，混合权重使用未加偏置的分数。
+# 训练步骤结束再更新负载平衡 bias，不增加 auxiliary loss；latent 变体在较小宽度运行 experts。
 """EAGLE-4 MoE draft MLPs, in the weight layout SGLang's EAGLE-4 loader reads."""
 
 import re
@@ -37,6 +39,7 @@ _PER_EXPERT_LATENT = re.compile(r"(.*\.experts)\.(\d+)\.(up_proj|down_proj)\.wei
 class Eagle4Router(nn.Module):
     """Sigmoid router whose expert-selection bias balances load without a loss."""
 
+    # 分配专家路由权重、持久 correction bias 和不持久 load 计数；update_rate 决定每步偏置调整幅度。
     def __init__(self, config):
         super().__init__()
         n = config.n_routed_experts
@@ -51,12 +54,15 @@ class Eagle4Router(nn.Module):
             getattr(config, "moe_router_bias_update_rate", 1e-3),
         )
 
+    # 执行常规模型设备/dtype 变换后强制 bias 回 float32，避免 bf16 无法表示小幅增量。
     def _apply(self, fn, recurse=True):
         # The bias stays fp32 through model.to(bf16): bf16 cannot take 1e-3 steps past |0.25|.
         super()._apply(fn, recurse)
         self.e_score_correction_bias = self.e_score_correction_bias.float()
         return self
 
+    # 全 rank 求和专家负载、清空计数，低于均值的专家加 bias，高于均值减 bias。
+    # 返回最大/平均负载供监控；应按 optimizer step 调一次而非每个 micro-batch 调用。
     @torch.no_grad()
     def update_bias(self) -> float:
         """Called once per optimizer step; returns max / mean expert load."""
@@ -71,6 +77,7 @@ class Eagle4Router(nn.Module):
 
 
 class SharedExpert(nn.Module):
+    # 构建共享 up/down，可选 gate；gated=False 用单路激活以匹配 latent 架构。
     def __init__(self, hidden_size, intermediate_size, act_fn, gated):
         super().__init__()
         if gated:
@@ -79,6 +86,7 @@ class SharedExpert(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.act_fn = act_fn
 
+    # 共享专家对每个 token 都执行：gated 时 act(gate(x))*up(x)，否则直接 act(up(x))。
     def forward(self, x):
         h = self.up_proj(x)
         gated = hasattr(self, "gate_proj")
@@ -88,6 +96,8 @@ class SharedExpert(nn.Module):
 class Eagle4MoE(nn.Module):
     """``sparse_swiglu`` (default) or ``nemotron_latent_relu2`` MoE replacing the dense MLP."""
 
+    # 创建路由器、打包专家权重和可选 latent/shared 投影；routed down 初始化为零。
+    # 因此新增专家库初始贡献为零，适合从已有 dense/shared 输出开始训练。
     def __init__(self, config):
         super().__init__()
         self.latent = getattr(config, "moe_architecture", "sparse_swiglu") == LATENT_MOE
@@ -125,6 +135,8 @@ class Eagle4MoE(nn.Module):
             else None
         )
 
+    # 先按每组最高两个 biased 分数筛组，再 top-k 选专家；最终权重从未加 bias 的 sigmoid 分数读取。
+    # 可归一化所选权重后乘 routed_scaling_factor，平衡偏置只改变选择而不直接改变混合概率。
     def route(self, x):
         """DeepSeek-V3 routing: top-k experts per token and their combine weights."""
         scores = F.linear(x.float(), self.gate.weight.float()).sigmoid()
@@ -144,6 +156,8 @@ class Eagle4MoE(nn.Module):
             weights = weights / weights.sum(-1, keepdim=True)
         return idx, weights * self.routed_scaling_factor
 
+    # 把 token-expert 对按专家排序，用 counts.cumsum 作 grouped GEMM 边界，算各专家 FFN。
+    # 按路由权重缩放后 index_add 回 token；同 token 的多个专家相加，最后加 shared 分支并恢复原形状。
     def forward(self, hidden_states):
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
         idx, weights = self.route(x)
@@ -153,6 +167,7 @@ class Eagle4MoE(nn.Module):
 
         # (token, slot) pairs sorted by expert feed one grouped GEMM per projection.
         order = idx.flatten().argsort()
+        # flatten 后第 p 个 token-expert 对的 token id 为 p//top_k；排序只重排执行顺序，不改变归属。
         tokens = order // self.top_k
         offs = counts.cumsum(0).int()
         h = self.fc1_latent_proj(x) if self.latent else x
@@ -167,6 +182,7 @@ class Eagle4MoE(nn.Module):
 
         # Weight each expert output and sum it back onto its token.
         out = out * weights.flatten()[order, None].to(out.dtype)
+        # 同一 token 可能路由到多个专家，必须加和而非 index_copy 覆盖；路由权重已在上一步乘入。
         out = h.new_zeros(h.shape).index_add_(0, tokens, out)
         if self.latent:
             out = self.fc2_latent_proj(out)
@@ -175,6 +191,7 @@ class Eagle4MoE(nn.Module):
         return out.view_as(hidden_states)
 
 
+# 把打包 [E,...] latent 权重拆成逐专家键并 clone，每个导出张量独立持有存储。
 def split_latent_experts(tensors: dict) -> dict:
     """Packed latent experts to the one-key-per-expert layout SGLang serves."""
     out = {}
@@ -188,6 +205,7 @@ def split_latent_experts(tensors: dict) -> dict:
     return out
 
 
+# 按专家数字 id 排序再 stack，恢复训练所需打包张量，未匹配的键保持不变。
 def stack_latent_experts(tensors: dict) -> dict:
     """Inverse of ``split_latent_experts``."""
     out, groups = {}, defaultdict(dict)

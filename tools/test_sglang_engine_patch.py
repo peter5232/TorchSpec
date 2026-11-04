@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# 端到端验证 SGLang spec_training 补丁：启动临时 Mooncake master、加载模型、prefill、读回张量并检查。
+# 这是依赖 CUDA、模型权重和服务二进制的集成程序，不是可随意执行的纯 CPU 单元测试。
+
 """Integration test for the sglang spec training patch.
 
 Launches a mooncake master subprocess, starts a sglang engine with
@@ -27,6 +30,7 @@ import traceback
 import torch
 
 
+# 遍历范围尝试 UDP bind 并返回候选；后续服务端口可能使用 TCP，此检查不保证 TCP 端口已被保留。
 def find_free_port(start=10000, end=60000):
     for port in range(start, end):
         try:
@@ -39,6 +43,7 @@ def find_free_port(start=10000, end=60000):
     raise RuntimeError(f"No free port found in range {start}-{end}")
 
 
+# 用 UDP connect 选择到外部地址的本地路由地址，失败回退回环；这里没有发送应用层探测报文。
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -50,6 +55,7 @@ def get_local_ip():
         return "127.0.0.1"
 
 
+# 依次检查构建目录、PATH、mooncake 包内二进制，找不到返回 None 供启动函数明确退出。
 def find_mooncake_master_bin():
     if "MOONCAKE_BUILD_DIR" in os.environ:
         path = os.path.join(os.environ["MOONCAKE_BUILD_DIR"], "mooncake-store/src/mooncake_master")
@@ -73,6 +79,7 @@ def find_mooncake_master_bin():
     return None
 
 
+# 启动带 HTTP 元数据服务的 master，注册退出清理并短暂等待，进程立即退出时打印 stderr 后失败。
 def launch_mooncake_master(host, grpc_port, http_port):
     binary = find_mooncake_master_bin()
     if binary is None:
@@ -89,6 +96,7 @@ def launch_mooncake_master(host, grpc_port, http_port):
     print(f"Launching mooncake master: {' '.join(cmd)}")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+    # 正常退出时终止临时 master，五秒不结束则 kill，防止测试留下服务进程。
     def _cleanup():
         if proc.poll() is None:
             proc.terminate()
@@ -109,6 +117,7 @@ def launch_mooncake_master(host, grpc_port, http_port):
     return proc
 
 
+# 为测试设置 TCP 协议、地址及固定缓冲容量，这些环境必须在 SGLang 子进程启动前准备。
 def set_mooncake_env(host, grpc_port, http_port):
     os.environ["MOONCAKE_LOCAL_HOSTNAME"] = host
     os.environ["MOONCAKE_MASTER_SERVER"] = f"{host}:{grpc_port}"
@@ -119,6 +128,7 @@ def set_mooncake_env(host, grpc_port, http_port):
     os.environ["MOONCAKE_HOST_BUFFER_SIZE"] = str(512 * 1024 * 1024)
 
 
+# 启动补丁引擎做零新 token 请求，按实际 prompt 长度读回辅助/最后隐状态，检查形状、非零及数值有限性，再删除对象。
 def test_spec_training(model_path, aux_layer_ids=None):
     import sglang as sgl
 
@@ -139,6 +149,7 @@ def test_spec_training(model_path, aux_layer_ids=None):
     print(f"  model_path: {model_path}")
     print(f"  aux_layer_ids: {aux_layer_ids}")
 
+    # 禁用 radix cache 保证整条 prompt 真正前向；启用辅助层捕获和 Mooncake 发布是补丁的核心接口。
     engine = sgl.Engine(
         model_path=model_path,
         disable_cuda_graph=True,
@@ -162,6 +173,7 @@ def test_spec_training(model_path, aux_layer_ids=None):
     print(f"  prompt: {test_prompt!r}")
     print(f"  data_id: {data_id}")
 
+    # 零新 token 请求验证的是 prefill 特征采集链路，不测 speculative decode 接受率或生成文本质量。
     results = engine.generate(
         prompt=test_prompt,
         sampling_params={"max_new_tokens": 0},
@@ -194,6 +206,7 @@ def test_spec_training(model_path, aux_layer_ids=None):
     seq_len = meta.get("prompt_tokens", 10)
     concat_hidden_size = num_aux_layers * hidden_size
 
+    # 用实际 prompt_tokens 与 K×H 构造读取规格；这里假设最后隐状态也保存且精度 BF16。
     shapes = {
         "hidden_states": (seq_len, concat_hidden_size),
         "input_ids": (seq_len,),
@@ -235,6 +248,7 @@ def test_spec_training(model_path, aux_layer_ids=None):
     )
 
     # --- Verify non-zero ---
+    # 非零只能排除明显空数据，不能证明捕获了正确层、正确 norm 位置或与 teacher 数值一致。
     assert not torch.all(hs == 0), "hidden_states is all zeros"
     assert not torch.all(lhs == 0), "last_hidden_states is all zeros"
     assert not torch.all(ids == 0), "input_ids is all zeros"
@@ -254,6 +268,7 @@ def test_spec_training(model_path, aux_layer_ids=None):
     print(f"  input_ids sample: {ids[:10].tolist()}")
 
     # --- Cleanup ---
+    # 成功路径删除远端对象并关闭资源；前面断言失败时不会走到这里，main 的 finally 只保证 master 清理。
     mc_store.remove_eagle3_tensors(key, has_last_hidden_states=True)
     mc_store.close()
     engine.shutdown()
@@ -263,6 +278,7 @@ def test_spec_training(model_path, aux_layer_ids=None):
     print(f"{'=' * 50}")
 
 
+# 解析小模型与捕获层，启动服务并设置环境，失败打印 traceback；finally 负责收尾 master。
 def main():
     parser = argparse.ArgumentParser(description="Test sglang spec training patch")
     parser.add_argument(

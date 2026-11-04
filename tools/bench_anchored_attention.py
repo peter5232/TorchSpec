@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# 比较全位置 TTT attention 与锚点 attention 的 mask/计算成本，使用随机 CUDA 张量。
+# 只测 attention 前向及 mask 构造，不测模型投影、反向或优化器；默认每策略单独子进程隔离编译状态。
+
 """Compare masking strategies for anchored Eagle3 attention.
 
     python tools/bench_anchored_attention.py --seq 384 4096 16384 --anchors 128 256
@@ -25,6 +28,7 @@ from torchspec.models.ops.flex_attention import (
 _compiled_create_block_mask = None
 
 
+# 懒创建并缓存 dynamic=True 的 block-mask 编译器；当前主测量路径直接使用导入的 compile_friendly 包装。
 def _compiled_builder():
     global _compiled_create_block_mask
     if _compiled_create_block_mask is None:
@@ -37,6 +41,7 @@ QK_DIM, V_DIM = HEAD_DIM, HEAD_DIM  # MLA splits these: 192 for Q/K, 128 for V
 B16 = torch.bfloat16
 
 
+# 把锚点与 keep 捕获进闭包，生成供 FlexAttention 使用的逐位置可见性谓词。
 def _mask_mod(anchors, keep, ctx_len, num_anchors):
     """BlockMask form of the anchored predicate, for the flex comparison only.
 
@@ -44,6 +49,7 @@ def _mask_mod(anchors, keep, ctx_len, num_anchors):
     the BlockMask path would cost.
     """
 
+    # 上下文只看锚点及其之前，追加链只看属于同一锚点的列，再与有效锚点 mask 相交。
     def mask_mod(b, h, q_idx, kv_idx):
         anchor = anchors[b, q_idx]
         context = (kv_idx < ctx_len) & (kv_idx <= anchor)
@@ -53,6 +59,7 @@ def _mask_mod(anchors, keep, ctx_len, num_anchors):
     return mask_mod
 
 
+# 每个展开深度调用一次 attention；SDPA 路径用布尔矩阵，Flex 路径把同一可见性转成 BlockMask。
 def _step(kind, anchors, keep, seq, num_anchors, query, cache, device):
     """One TTT unroll: an attention call per depth over a KV cache that grows by num_anchors."""
     mask_mod = _mask_mod(anchors, keep, seq, num_anchors)
@@ -68,6 +75,7 @@ def _step(kind, anchors, keep, seq, num_anchors, query, cache, device):
             )
 
 
+# 所有 S 个位置都是 query，按深度扩大 KV，并用 EAGLE3 block mask 表达历史展开位置。
 def _dense_step(seq, query, cache, device):
     """Dense TTT attention: every position is a query, KV grows by seq each depth."""
     from torchspec.models.ops.flex_attention import eagle3_block_mask
@@ -81,7 +89,9 @@ def _dense_step(seq, query, cache, device):
         )
 
 
+# 创建给定长度和头维度的随机 Q/K/V，预热后同步计时多次前向；返回平均毫秒及 allocated 峰值十进制 GB。
 def measure(kind, seq, num_anchors, device, reps, warmup, layers=1):
+    # 全位置路径 Q=[1,heads,S,D]，每深度 KV 增长 S；锚点路径 Q 长度为 A，KV 每步只增长 A。
     if kind == "dense-ttt":
         query = torch.randn(1, HEADS, seq, QK_DIM, device=device, dtype=torch.bfloat16)
         cache = [
@@ -110,16 +120,19 @@ def measure(kind, seq, num_anchors, device, reps, warmup, layers=1):
         dense_q = torch.randn(1, HEADS, seq, QK_DIM, device=device, dtype=torch.bfloat16)
         dense_kv = cache[0]
 
+        # 重复指定层数的锚点展开；多层时先加入稠密上下文计算，以反映后层需要前层全位置输出的额外工作。
         def run():
             for _ in range(layers):
                 if layers > 1:
                     _dense_step(seq, dense_q, [dense_kv], device)
                 _step(kind, *args)
 
+    # 先触发编译及首次分配，稳定后再计时；峰值包含已有 Q/K/V，不能解读为单次调用新增内存。
     for _ in range(warmup):
         run()
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
+    # 使用整段重复调用的墙钟平均值，前后同步 GPU；没有 backward，因此不能直接推断训练总加速比。
     start = time.perf_counter()
     for _ in range(reps):
         run()
@@ -131,6 +144,7 @@ def measure(kind, seq, num_anchors, device, reps, warmup, layers=1):
 KINDS = ["dense-ttt", "sdpa", "flex+blockmask"]
 
 
+# 解析序列、锚点、深度与 MLA 维度；单策略直接跑，默认逐策略开子进程再收集 RESULT 行比较。
 def main():
     global DEPTHS, KV_HEADS, QK_DIM, V_DIM
     parser = argparse.ArgumentParser(description=__doc__)
@@ -172,6 +186,7 @@ def main():
                 print(f"RESULT {seq} {num_anchors} {args.kind} {ms:.3f} {peak:.3f}")
         return
 
+    # 每策略单独 Python 进程，避免前一策略预热编译器内部状态而让后一策略获得不对称优势。
     results = {}
     for kind in args.kinds:
         out = subprocess.run(
@@ -197,6 +212,7 @@ def main():
             capture_output=True,
             text=True,
         )
+        # 只解析 RESULT 行；子进程没有输出结果时表中会是 n/a，需要另查失败原因，不表示该策略速度为零。
         for line in out.stdout.splitlines():
             if line.startswith("RESULT"):
                 _, seq, anch, k, ms, peak = line.split()

@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 根据推理后端和 Ray placement group 创建 actor，并把慢速模型初始化发到目标节点。
+# prepare 返回尚待等待的 ObjectRef，阻塞入口则等待就绪；多节点只把 head 返回给请求分发器。
+
 """Inference engine creation and initialization with Ray placement groups."""
 
 import ray
@@ -31,6 +34,7 @@ from torchspec.utils.logging import logger
 _alive_worker_engines: list = []
 
 
+# 阻塞式总入口：离线回放单独用 CPU 路径，在线后端按类型建立引擎并等到初始化结束。
 def create_inference_engines(args, inference_pg, mooncake_config, engine_group: int = 0):
     """Create inference engines based on configured engine type (blocking).
 
@@ -65,6 +69,7 @@ def create_inference_engines(args, inference_pg, mooncake_config, engine_group: 
     return engines
 
 
+# 只创建 actor 和发送 init，返回引擎及初始化引用；上层可同时准备训练侧，使用前必须等待引用完成。
 def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group: int = 0):
     """Create inference engines and fire init calls without waiting.
 
@@ -105,6 +110,7 @@ def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group:
     return engines, init_refs
 
 
+# 创建正数个 CPU 回放 actor，不占推理 placement GPU；每个 actor 都收到相同 Mooncake 配置。
 def _prepare_offline_replay_engines(
     args, mooncake_config, engine_group: int = 0
 ) -> tuple[list, list]:
@@ -129,6 +135,7 @@ def _prepare_offline_replay_engines(
     return engines, init_refs
 
 
+# 把已选择的后端路由到阻塞式初始化器；未知类型直接报错，不隐式换成其他引擎。
 def init_engines(args, pg, engine_type: str, mooncake_config=None, engine_group: int = 0) -> list:
     """Initialize inference engines with Ray placement groups.
 
@@ -155,6 +162,7 @@ def init_engines(args, pg, engine_type: str, mooncake_config=None, engine_group:
         raise ValueError(f"Unknown engine_type: {engine_type}")
 
 
+# 按单节点可容纳的 GPU 数限制每引擎配置，再通过公共 actor 工厂启动 HF 模型加载。
 def _prepare_hf_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> tuple[list, list]:
     """Create HF engine actors and fire init calls without waiting.
 
@@ -184,6 +192,7 @@ def _prepare_hf_engines(args, pg, mooncake_config=None, engine_group: int = 0) -
     )
 
 
+# 等待 HF 初始化引用，采用较长模型加载超时后返回可调用引擎。
 def _init_hf_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> list:
     """Initialize HF engines with Ray placement groups."""
     engines, init_handles = _prepare_hf_engines(args, pg, mooncake_config, engine_group)
@@ -191,6 +200,8 @@ def _init_hf_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> l
     return engines
 
 
+# 先创建所有节点 actor，再为每个模型副本协商地址、逐个选端口，最后并发触发初始化。
+# 跨节点 worker 保留在模块列表以免被回收；只有 node_rank=0 的 head 接收 generate。
 def _prepare_sgl_engines(
     args, pg, mooncake_config=None, engine_group: int = 0
 ) -> tuple[list, list]:
@@ -214,6 +225,8 @@ def _prepare_sgl_engines(
 
     if nnodes > 1:
         gpus_per_node = getattr(args, "inference_num_gpus_per_node", 8)
+        # 例如总 32 卡、每节点 8 卡、每副本跨 2 节点：得到 2 个副本、4 个 actor。
+        # 最终只有 2 个 head 接请求，其余 actor 仍必须存活以参与同一副本的 TP 通信。
         gpus_per_replica = nnodes * gpus_per_node
         num_replicas = num_gpus_total // gpus_per_replica
         num_engines = num_replicas * nnodes
@@ -230,6 +243,8 @@ def _prepare_sgl_engines(
 
     from torchspec.inference.engine.sgl_engine import SglEngine
 
+    # placement group 负责资源位置；重排后的 bundle 和 GPU ID 必须使用同一 offset，
+    # 否则 actor 所在节点与它准备绑定的设备会不一致。
     pg_obj, reordered_bundle_indices, reordered_gpu_ids = pg
 
     SglRayActor = ray.remote(SglEngine)
@@ -238,6 +253,7 @@ def _prepare_sgl_engines(
     # Step 1: Create all engine actors (without calling init yet)
     engines = []
     for i in range(num_engines):
+        # 连续 nnodes 个 actor 属于同一模型副本，模运算得到其副本内节点号。
         node_rank = i % nnodes if nnodes > 1 else 0
 
         bundle_offset = i * gpus_per_engine
@@ -266,6 +282,7 @@ def _prepare_sgl_engines(
 
     # Step 2: Auto-negotiate dist_init_addr for each multi-node replica
     # Uses RayActor.get_node_ip() and .find_free_port() on the node_rank=0 engine
+    # 每份模型副本建立独立通信地址；两个副本不能误连进同一个 TP 进程组。
     dist_init_addrs: dict[int, str] = {}
     if nnodes > 1:
         configured_addr = getattr(args, "sglang_dist_init_addr", None)
@@ -288,6 +305,7 @@ def _prepare_sgl_engines(
     # Step 2.5: Pre-allocate ports to avoid TOCTOU races between parallel engines.
     # Each engine needs 2 consecutive ports; allocate sequentially so engines
     # on the same node never collide.
+    # 串行寻找端口降低并发初始化时选到相同端口的风险；扫描并不等同永久绑定端口。
     pre_allocated_ports: dict[int, int] = {}
     next_start = 10000
     for i in range(num_engines):
@@ -300,6 +318,8 @@ def _prepare_sgl_engines(
         logger.info(f"Engine {i}: pre-allocated ports {port}, {port + 1}")
 
     # Step 3: Fire init() on all engines (non-blocking)
+    # 所有远程初始化先发出去再统一等待，允许不同节点并行加载。
+    # 若逐个 init 后立刻等结果，多节点集合通信可能一直等尚未启动的同伴。
     init_handles = []
     for i, engine in enumerate(engines):
         replica_idx = i // nnodes if nnodes > 1 else i
@@ -326,6 +346,7 @@ def _prepare_sgl_engines(
     return engines, init_handles
 
 
+# 等待 head 和 worker 全部完成 SGLang 初始化；超时依据配置及单/多节点默认值决定。
 def _init_sgl_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> list:
     """Initialize SGLang engines with Ray placement groups (blocking)."""
     head_engines, init_handles = _prepare_sgl_engines(args, pg, mooncake_config, engine_group)
@@ -335,6 +356,8 @@ def _init_sgl_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> 
     return head_engines
 
 
+# 按副本和节点划分 actor，每个副本使用自己的 head 地址与预选端口，初始化引用覆盖所有节点。
+# 返回的 head 数等于副本数，不等于参与 TP/PP 的 actor 总数。
 def _prepare_vllm_engines(
     args, pg, mooncake_config=None, engine_group: int = 0
 ) -> tuple[list, list]:
@@ -355,6 +378,7 @@ def _prepare_vllm_engines(
     nnodes = getattr(args, "vllm_nnodes", 1)
     num_gpus_total = getattr(args, "inference_num_gpus", 1)
 
+    # 先按一份副本所需节点数计算副本数量；跨节点 actor 的数量不是可独立服务的模型数量。
     if nnodes > 1:
         gpus_per_node = getattr(args, "inference_num_gpus_per_node", 8)
         gpus_per_replica = nnodes * gpus_per_node
@@ -380,6 +404,7 @@ def _prepare_vllm_engines(
 
     engines = []
     for i in range(num_engines):
+        # 副本内 rank 0 拥有请求前端，其他节点由 VllmEngine 启动 headless executor。
         node_rank = i % nnodes if nnodes > 1 else 0
 
         bundle_offset = i * gpus_per_engine
@@ -408,6 +433,7 @@ def _prepare_vllm_engines(
 
     # Pre-allocate ports to avoid TOCTOU races between parallel engines.
     # Each engine needs 2 consecutive ports (dist_init + nccl).
+    # 先固定每个 actor 的端口候选，再从 head 的候选构造副本初始化地址，保持双方配置一致。
     pre_allocated_ports: dict[int, int] = {}
     next_start = 10000
     for i in range(num_engines):
@@ -438,6 +464,7 @@ def _prepare_vllm_engines(
                     f"Replica {replica_idx}: dist_init_addr from pre-allocated port: {addr}"
                 )
 
+    # 返回值保留所有节点的初始化引用；只等待 head 不足以证明 follower 已进入通信组。
     init_handles = []
     for i, engine in enumerate(engines):
         replica_idx = i // nnodes if nnodes > 1 else i
@@ -452,6 +479,7 @@ def _prepare_vllm_engines(
     if nnodes > 1:
         head_engines = [engines[i] for i in range(num_engines) if i % nnodes == 0]
         worker_engines = [engines[i] for i in range(num_engines) if i % nnodes != 0]
+        # 保存非请求入口的强引用，避免局部列表退出作用域后 worker actor 被回收。
         _alive_worker_engines.extend(worker_engines)
         logger.info(
             f"Prepared multi-node vLLM engines: {len(head_engines)} heads + "
@@ -462,6 +490,7 @@ def _prepare_vllm_engines(
     return engines, init_handles
 
 
+# 同步等待全部 vLLM 节点就绪，再只返回请求入口列表。
 def _init_vllm_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> list:
     """Initialize vLLM engines with Ray placement groups (blocking)."""
     head_engines, init_handles = _prepare_vllm_engines(args, pg, mooncake_config, engine_group)
@@ -471,6 +500,7 @@ def _init_vllm_engines(args, pg, mooncake_config=None, engine_group: int = 0) ->
     return head_engines
 
 
+# 为每个单节点 TP 副本分配连续 GPU；TP=1 由 Ray 限制可见设备，TP>1 由后端显式绑定设备块。
 def _prepare_trtllm_engines(
     args, pg, mooncake_config=None, engine_group: int = 0
 ) -> tuple[list, list]:
@@ -510,6 +540,7 @@ def _prepare_trtllm_engines(
     # TRT-LLM's MPI workers bind GPUs themselves, so assignment differs by TP degree:
     # tp==1 drops NOSET and reserves a whole GPU so Ray scopes it as cuda:0 per engine;
     # tp>1 keeps NOSET, pins a contiguous block in init(), and reserves a 0.2 placeholder.
+    # 单 GPU actor 让 Ray 设置可见设备；多 GPU TP 则让 MPI worker 看到引擎专属的连续设备块。
     single_gpu = gpus_per_engine == 1
     if single_gpu:
         env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
@@ -517,6 +548,7 @@ def _prepare_trtllm_engines(
 
     engines = []
     for i in range(num_engines):
+        # 每个副本按其卡数跳过前一块资源，而不是让相邻副本都从 GPU 0 开始。
         bundle_offset = i * gpus_per_engine
         base_gpu_id = int(reordered_gpu_ids[bundle_offset])
 
@@ -541,10 +573,12 @@ def _prepare_trtllm_engines(
         )
         engines.append(engine)
 
+    # TRT-LLM 自行管理 MPI 启动，无需复制 SGLang/vLLM 的跨节点地址协商；仍汇合初始化引用。
     init_handles = [engine.init.remote(mooncake_config=mooncake_config) for engine in engines]
     return engines, init_handles
 
 
+# 等待 TRT-LLM 自身 MPI worker 初始化完成，超时使用该后端配置。
 def _init_trtllm_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> list:
     """Initialize TensorRT-LLM engines with Ray placement groups (blocking)."""
     engines, init_handles = _prepare_trtllm_engines(args, pg, mooncake_config, engine_group)
@@ -553,6 +587,7 @@ def _init_trtllm_engines(args, pg, mooncake_config=None, engine_group: int = 0) 
     return engines
 
 
+# 仅接受单节点且至少一个引擎，把连续 GPU 块和 placement bundle 传给 TokenSpeed actor。
 def _prepare_tokenspeed_engines(
     args, pg, mooncake_config=None, engine_group: int = 0
 ) -> tuple[list, list]:
@@ -565,6 +600,7 @@ def _prepare_tokenspeed_engines(
 
     num_gpus_total = getattr(args, "inference_num_gpus", 1)
     gpus_per_engine = getattr(args, "inference_num_gpus_per_engine", 1)
+    # 模型副本数由总卡数整除每副本卡数得到；零副本是配置错误，不能返回空列表悄悄继续。
     num_engines = num_gpus_total // gpus_per_engine
     if num_engines <= 0:
         raise ValueError("TokenSpeed requires at least one inference engine")
@@ -576,6 +612,7 @@ def _prepare_tokenspeed_engines(
     env_vars = get_torchspec_env_vars()
     engines = []
     for index in range(num_engines):
+        # 用同一偏移定位 placement bundle 和第一张物理 GPU，使设备连续块与调度位置对应。
         bundle_offset = index * gpus_per_engine
         base_gpu_id = int(reordered_gpu_ids[bundle_offset])
         scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -599,6 +636,7 @@ def _prepare_tokenspeed_engines(
             )
         )
 
+    # 引擎对象先全部创建，模型加载请求随后发送，返回 init_refs 让调用者选择何时同步。
     init_refs = [engine.init.remote(mooncake_config=mooncake_config) for engine in engines]
     logger.info(
         "Preparing %d TokenSpeed engine(s), %d GPU(s) each",
@@ -608,6 +646,7 @@ def _prepare_tokenspeed_engines(
     return engines, init_refs
 
 
+# 在非阻塞准备之后等待所有 TokenSpeed init 引用，避免尚未加载模型就分发请求。
 def _init_tokenspeed_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> list:
     engines, init_refs = _prepare_tokenspeed_engines(args, pg, mooncake_config, engine_group)
     timeout = getattr(args, "tokenspeed_init_timeout", 600)
@@ -615,6 +654,8 @@ def _init_tokenspeed_engines(args, pg, mooncake_config=None, engine_group: int =
     return engines
 
 
+# 公共构建器将重排后的 bundle 与物理 GPU 基址配对，传入环境变量，再发送每个 actor 的 init 调用。
+# num_gpus=0.2 是 actor 的调度占位；实际模型设备范围来自 placement 规划和后端配置，不能解释为模型只用五分之一张卡。
 def _create_and_init_actors(
     args,
     pg,
@@ -651,6 +692,7 @@ def _create_and_init_actors(
 
         base_gpu_id = int(reordered_gpu_ids[i * num_gpus_per_engine])
 
+        # 指定 bundle 固定 actor 放置位置，并让子任务继承 placement group 约束。
         scheduling_strategy = PlacementGroupSchedulingStrategy(
             placement_group=pg_obj,
             placement_group_capture_child_tasks=True,
@@ -659,6 +701,7 @@ def _create_and_init_actors(
 
         env_vars = get_torchspec_env_vars()
 
+        # 构造参数只携带配置和部署身份，模型初始化留到远端 init；额外参数可补充后端专用信息。
         constructor_kwargs = {
             "args": args,
             "rank": i,
@@ -676,11 +719,13 @@ def _create_and_init_actors(
         ).remote(**constructor_kwargs)
 
         engines.append(engine)
+        # 把未完成初始化的引用保存下来，后续由统一等待函数处理超时和异常。
         init_handles.append(engine.init.remote(mooncake_config=mooncake_config))
 
     return engines, init_handles
 
 
+# 用 ray.get 汇合初始化任务；超时后仅查询哪些引用完成以补充日志，并重新抛出原错误。
 def _wait_for_init(init_handles: list, engine_label: str, timeout: int = 300):
     """Wait for engine init calls to complete with error handling.
 

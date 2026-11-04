@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Mooncake 子包的公共入口：轻量工具直接导出，配置和存储类按属性访问时再导入。
+# 这样配置模块也能引用工具，而不会与依赖配置的存储实现形成循环导入。
+
 from torchspec.transfer.mooncake.helpers import calculate_eagle3_buffer_size
 from torchspec.transfer.mooncake.utils import (
     MooncakeMaster,
@@ -27,6 +30,7 @@ from torchspec.transfer.mooncake.utils import (
 )
 
 
+# 只对三个延迟公开的类执行实际导入；未知名称抛 AttributeError，让正常 Python 属性检查语义保持不变。
 def __getattr__(name):
     # Lazy imports to avoid circular dependency with config.mooncake_config
     if name == "MooncakeConfig":

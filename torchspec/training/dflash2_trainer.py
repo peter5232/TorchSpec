@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# DFlash2 的轻量构建适配：保留 DFlash 训练循环，替换配置、网络及带 selector 损失的 wrapper。
+
 """DFlash2 trainer."""
 
 from argparse import Namespace
@@ -31,10 +33,12 @@ class DFlash2Trainer(DFlashTrainer):
     _draft_config_class = DFlash2Config
     _extra_loss_component_keys = ["selector_loss"]
 
+    # 继承基础 block 训练参数，再记录 candidate selector 辅助损失的系数。
     def __init__(self, args: Namespace):
         super().__init__(args)
         self.selector_loss_alpha = getattr(args, "dflash2_selector_loss_alpha", 1.0)
 
+    # 严格核对 block_size 和目标层数在训练参数与网络配置间一致，避免张量布局隐式错配。
     def _build_draft_model(self, config):
         if config.block_size != self.block_size:
             raise ValueError(
@@ -49,6 +53,7 @@ class DFlash2Trainer(DFlashTrainer):
             )
         return DFlash2DraftModel(config)
 
+    # 将共用损失配置及 selector_loss_alpha 传给 DFlash2Model，额外指标由父类统一池化。
     def _build_training_wrapper(self, draft_model):
         return DFlash2Model(
             draft_model=draft_model,

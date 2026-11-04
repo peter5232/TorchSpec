@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 草稿参数层与配置的统一导出；AutoDraftModelConfig 解析架构，AutoEagle3DraftModel 实例化。
+# 这里的模型负责张量前向，训练目标与多步展开由上一级包装器负责。
 from torchspec.models.draft.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from torchspec.models.draft.base import Eagle3DraftModel
 from torchspec.models.draft.deepseek_eagle import Eagle3DeepseekV2ForCausalLM

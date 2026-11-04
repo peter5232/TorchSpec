@@ -18,4 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 训练包命名空间：具体 Trainer、优化器、FSDP 与检查点按需从子模块导入；本文件不启动训练。
+
 """Training package: FSDP training actors, optimizer, lr scheduler, checkpointing."""

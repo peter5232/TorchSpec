@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# TokenSpeed 适配器使用 prefill 隐状态捕获，把后端已发布的键转成 TorchSpec 样本元数据。
+# 当前实现明确限定单节点、文本、非 decode，并要求保存 last_hidden_states。
+
 """Ray actor wrapper for TokenSpeed offline hidden-state materialization."""
 
 from __future__ import annotations
@@ -56,9 +59,11 @@ _PROTECTED_ENGINE_KEYS = frozenset(
 )
 
 
+# 封装 TokenSpeed Engine 的启动和训练数据协议，张量写入发生在后端内部。
 class TokenSpeedEngine(InferenceEngine, RayActor):
     """Use TokenSpeed eager prefill to publish TorchSpec Mooncake records."""
 
+    # 记录 actor 拓扑及空引擎、空模型维度；捕获层列表在读取目标模型配置后填充。
     def __init__(
         self,
         args,
@@ -80,6 +85,8 @@ class TokenSpeedEngine(InferenceEngine, RayActor):
         self.aux_hidden_state_layer_ids: list[int] = []
         setup_file_logging("inference", self.rank, group=engine_group)
 
+    # 校验单节点和训练模式，设置 GPU 与 Mooncake 环境，再读取隐藏维度及辅助层并创建 Engine。
+    # 托管参数会覆盖或过滤 extra_args；TP 必须等于该引擎实际占用 GPU 数，避免拓扑与资源分配脱节。
     def init(
         self,
         mooncake_config=None,
@@ -98,6 +105,7 @@ class TokenSpeedEngine(InferenceEngine, RayActor):
                 "TokenSpeed currently supports offline prefill, not train_with_decode"
             )
 
+        # 在导入并启动实际 Engine 前定位当前 GPU；后端子进程继承正确设备配置。
         if self.base_gpu_id is not None:
             self.local_gpu_id = self.setup_gpu(self.base_gpu_id)
         else:
@@ -120,6 +128,7 @@ class TokenSpeedEngine(InferenceEngine, RayActor):
 
         from transformers import AutoConfig
 
+        # 只读模型配置取得 H 和层总数，以后返回 shape 无需把巨大张量重新拉回 actor。
         model_config = AutoConfig.from_pretrained(
             self.args.target_model_path,
             trust_remote_code=getattr(self.args, "trust_remote_code", True),
@@ -150,6 +159,7 @@ class TokenSpeedEngine(InferenceEngine, RayActor):
             extra = OmegaConf.to_container(extra_args, resolve=True)
         else:
             extra = dict(extra_args or {})
+        # 模型路径、TP、捕获开关等由集成层统一管理，避免 extra_args 改变写入协议却仍返回旧元数据。
         blocked = extra.keys() & _PROTECTED_ENGINE_KEYS
         if blocked:
             logger.warning(
@@ -180,6 +190,7 @@ class TokenSpeedEngine(InferenceEngine, RayActor):
 
         from tokenspeed.runtime.entrypoints.engine import Engine
 
+        # 真正的模型及执行资源在这里创建；之前的错误检查尽量放在昂贵加载之前。
         self._engine = Engine(**engine_kwargs)
         logger.info(
             "TokenSpeedEngine rank %d initialized: model=%s tp=%d aux_layers=%s",
@@ -189,6 +200,8 @@ class TokenSpeedEngine(InferenceEngine, RayActor):
             self.aux_hidden_state_layer_ids,
         )
 
+    # 文本和 token 输入必须二选一；token 输入规范成一维，执行 max_new_tokens=0 的全序列捕获。
+    # 每条结果必须恰有一个键；shape 使用实际 prompt_tokens，辅助层沿最后一维拼接，未添加 batch 维。
     def generate(
         self,
         data_id: str | list[str],
@@ -210,6 +223,7 @@ class TokenSpeedEngine(InferenceEngine, RayActor):
             raise ValueError("Exactly one of input_ids_ref or formatted_prompts must be set")
 
         input_ids_list: list[list[int]] | None = None
+        # 文本由后端分词，长度只能以后端结果为准；token 路径可保留输入长度作为后备。
         if formatted_prompts is not None:
             request_kwargs = {"prompt": formatted_prompts}
             expected_lengths = None
@@ -229,6 +243,7 @@ class TokenSpeedEngine(InferenceEngine, RayActor):
             request_kwargs = {"input_ids": input_ids_list}
             expected_lengths = [len(ids) for ids in input_ids_list]
 
+        # max_new_tokens=0 表示不续写，只让已知序列经过模型并捕获各位置表示。
         results = self._engine.generate(
             **request_kwargs,
             sampling_params={"max_new_tokens": 0, "temperature": 0},
@@ -240,6 +255,7 @@ class TokenSpeedEngine(InferenceEngine, RayActor):
         outputs = []
         for index, result in enumerate(results):
             keys = result.get("meta_info", {}).get("spec_training_mooncake_store_keys", [])
+            # 当前协议是一条请求一个对象组，缺键或多键都拒绝，避免默默错配样本。
             if len(keys) != 1:
                 raise RuntimeError(
                     f"TokenSpeed did not return exactly one Mooncake key for result {index}: {keys}"
@@ -249,6 +265,7 @@ class TokenSpeedEngine(InferenceEngine, RayActor):
                 seq_len = expected_lengths[index]
             if seq_len is None:
                 raise RuntimeError("TokenSpeed did not report prompt_tokens")
+            # 元数据只保留每样本 S、层拼接宽度 K×H 和真实存储 dtype，网络返回体无需携带隐藏张量。
             outputs.append(
                 {
                     "mooncake_key": keys[0],
@@ -269,16 +286,19 @@ class TokenSpeedEngine(InferenceEngine, RayActor):
             )
         return outputs
 
+    # 当前仅检查 Engine 实例存在，不发起推理请求。
     def health_check(self, timeout: float = 5.0) -> bool:
         del timeout
         return self._engine is not None
 
+    # 调用 TokenSpeed 自身的关闭入口，再清空本地引用。
     def shutdown(self) -> None:
         if self._engine is not None:
             self._engine.shutdown()
             self._engine = None
         logger.info("TokenSpeedEngine rank %d shutdown complete", self.rank)
 
+    # 汇报 actor 位置与读取到的 hidden_size，帮助核对元数据维度。
     def get_status(self) -> dict:
         return {
             "rank": self.rank,

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# 比较五种 EAGLE3 mask 表达方式的首次准备成本与稳定前后向延迟。
+# 使用 CUDA、FlashAttention/Cute 等实际依赖；文档字符串中的历史数字不是本次硬件实测结论。
+
 """Benchmark different EAGLE3 mask_mod modes for flash attention.
 
 Compares compile time and per-call fwd+bwd latency across five mask_mod strategies:
@@ -56,6 +59,7 @@ from torchspec.models.draft.llama3_eagle import (
 ALL_MODES = ["closure", "simple", "dynamic", "seqlen", "seqlen_po2"]
 
 
+# 清空模型 mask、block-sparse 和 FlashAttention Python 编译缓存，让不同 mode 尽量不继承已构建结果。
 def _clear_compile_caches():
     """Clear all flash_attn compile caches + mask_mod caches."""
     from torchspec.models.draft import llama3_eagle as mod
@@ -78,6 +82,7 @@ def _clear_compile_caches():
         _flash_attn_bwd.compile_cache.clear()
 
 
+# 调用自定义 attention autograd 并对输出求和反向；函数体没有 synchronize，同步由测量调用者负责。
 def run_fwd_bwd(q, k, v, mask_mod_cute, mask_mod_flex, softmax_scale, max_seq_len, aux_tensors):
     """Run forward + backward and synchronize."""
     out = _EagleMaskedFlashAttnFunc.apply(
@@ -92,6 +97,7 @@ def run_fwd_bwd(q, k, v, mask_mod_cute, mask_mod_flex, softmax_scale, max_seq_le
 # --------------------------------------------------------------------------- #
 
 
+# 先枚举 snap 后的唯一长度做首次执行，再对每个请求长度预热并用 CUDA event 计时；返回首次阶段总时间和平均延迟。
 def bench_mode(
     mode: str,
     q_lens: list[int],
@@ -113,9 +119,11 @@ def bench_mode(
     torch.cuda.synchronize()
 
     # --- Compile phase: time building all buckets ---
+    # 原始长度先 snap 到实现使用的桶，重复桶只首次执行一次；例如 384→512 时实际工作量按 512 分配。
     snapped = sorted(set(_snap_q_len(ql, mode) for ql in q_lens))
     print(f"  [{mode}] {len(snapped)} bucket(s): {snapped}")
 
+    # 这里标记 compile 的时间也包括随机张量创建和每桶首次前后向，不是纯编译器 CPU 时间。
     t0 = time.perf_counter()
     for sq in snapped:
         kv_len = sq * (1 + lck)
@@ -135,6 +143,7 @@ def bench_mode(
 
     # --- Per-call latency per q_len ---
     results = {}
+    # 只有 Q 设置 requires_grad=True，K/V 在本脚本中不求梯度；这不是所有 attention 输入都需要反向的完整训练形态。
     for ql in q_lens:
         sq = _snap_q_len(ql, mode)
         kv_len = sq * (1 + lck)
@@ -164,6 +173,7 @@ def bench_mode(
             end_events[i].record()
         torch.cuda.synchronize()
 
+        # CUDA event 测设备时间，最后统一同步才读取；与 benchmark_eagle3 的同步墙钟步时间统计口径不同。
         times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
         avg_ms = sum(times) / len(times)
         results[ql] = avg_ms
@@ -173,6 +183,7 @@ def bench_mode(
     return compile_time, results
 
 
+# 逐 mode 运行并选择 closure 或首项为基准；编译列是基准/当前的加速比，延迟列是当前/基准的耗时比。
 def main():
     parser = argparse.ArgumentParser(description="Benchmark EAGLE3 mask_mod modes")
     parser.add_argument(

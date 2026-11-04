@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 集中导出推理接口和可用后端，方便调用方选择实现。
+# 可选后端通过捕获 ImportError 隔离缺少依赖的环境；模型加载仍在各引擎 init 中执行。
+
 
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.inference.engine.hf_engine import HFEngine

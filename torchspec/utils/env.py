@@ -1,3 +1,5 @@
+# Ray actor 环境转发策略：传递明确白名单和设备可见性控制，不转发跨节点共享的 Inductor 缓存路径。
+
 import os
 
 # Environment variables that should be forwarded to all Ray actors.
@@ -45,6 +47,8 @@ _RAY_NOSET_VISIBLE_DEVICES_KEYS = [
 ]
 
 
+# 合并默认环境、禁止 Ray 重写设备可见性的标志和当前进程白名单，显式环境值最后覆盖默认值。
+# 返回字典供 runtime_env 使用；本函数本身不修改当前 os.environ。
 def get_torchspec_env_vars() -> dict[str, str]:
     """Return common environment variables for all Ray actors.
 

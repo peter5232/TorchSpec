@@ -18,9 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：Kimi K3 的 XTML 编码交给 checkpoint 自带 tokenizer，避免手工拼字符串破坏分段编码。
+# 此类只校验控制 token 协议并识别 assistant 正文，以相同切片同步截断 token 和 mask。
+# 用户文本里的控制符字面量必须作为普通内容编码，不能伪装成角色边界。
+
 from typing import Any
 
 
+# 根据 tokenizer 实际输出推导边界，不硬编码 assistant 单词的普通 token ID。
 class K3Renderer:
     """Render Kimi-K3 XTML through the checkpoint's remote tokenizer code.
 
@@ -47,6 +52,7 @@ class K3Renderer:
     # semantics change in a way that can alter input_ids or loss masks.
     CACHE_VERSION = "generation-config-v3"
 
+    # 读取四个结构 token ID，用最小 assistant 消息探测真实头部，再校验 tokenizer 的边界隔离行为。
     def __init__(self, tokenizer: Any):
         self.tokenizer = tokenizer
         self.open_id = self._get_special_id(self._OPEN_TOKEN)
@@ -60,6 +66,7 @@ class K3Renderer:
         self.assistant_header_ids = self._derive_assistant_header(assistant_probe)
         self._validate_tokenizer_contract(assistant_probe)
 
+    # 要求 special_tokens 映射中存在且为整数；缺失时立即失败，不用普通 encode 结果冒充控制 token。
     def _get_special_id(self, token: str) -> int:
         special_tokens = getattr(self.tokenizer, "special_tokens", None)
         if not isinstance(special_tokens, dict) or token not in special_tokens:
@@ -69,6 +76,7 @@ class K3Renderer:
             raise TypeError(f"Special token {token!r} has non-integer id {token_id!r}")
         return token_id
 
+    # 只接受扁平整数列表/元组，拒绝嵌套 batch 或意外张量返回，保持 renderer 输出契约简单明确。
     @staticmethod
     def _normalize_token_ids(token_ids: Any) -> list[int]:
         if not isinstance(token_ids, (list, tuple)):
@@ -81,6 +89,8 @@ class K3Renderer:
             raise TypeError("Kimi-K3 tokenizer returned non-integer or nested token ids")
         return normalized
 
+    # 将完整编码权交给 tokenizer，保留思考但不加生成头，也不在 tokenizer 内先截断。
+    # 未指定 thinking_effort 保持 None，避免额外注入原请求没有要求的系统提示。
     def _apply_chat_template(
         self,
         messages: list[dict[str, Any]],
@@ -112,6 +122,8 @@ class K3Renderer:
         )
         return self._normalize_token_ids(token_ids)
 
+    # 样本无配置时沿用默认；显式配置则校验 thinking/effort/兼容 reasoning_effort 一致。
+    # 支持 low/high/max，而非自动把通用 medium 猜成某个模型等级。
     @classmethod
     def _resolve_generation_config(
         cls,
@@ -154,6 +166,7 @@ class K3Renderer:
             )
         return thinking, thinking_effort
 
+    # 关闭 thinking 时拒绝会被丢弃的非空 reasoning 字段，防止悄悄改变训练内容。
     @classmethod
     def _validate_disabled_thinking_messages(
         cls,
@@ -168,6 +181,7 @@ class K3Renderer:
                     f"assistant reasoning in message {index}"
                 )
 
+    # 在探测输出的最后一条消息内取 open 到 sep 前的 token 子串，跳过 tokenizer 可能插入的系统消息。
     def _derive_assistant_header(self, assistant_probe: list[int]) -> list[int]:
         """Extract the outer assistant header from remote-tokenizer output."""
         try:
@@ -194,6 +208,8 @@ class K3Renderer:
             raise ValueError("Could not derive a valid Kimi-K3 assistant header")
         return header
 
+    # 确认 assistant probe 有一个正文区间，再对比普通 user 和含控制符字面量 user 的特殊 ID 计数。
+    # 若用户内容增加结构 token 计数，就无法可靠识别角色边界，应拒绝该 tokenizer 契约。
     def _validate_tokenizer_contract(self, assistant_probe: list[int]) -> None:
         spans = self._assistant_spans(assistant_probe)
         if len(spans) != 1 or self.eom_id not in assistant_probe:
@@ -225,6 +241,7 @@ class K3Renderer:
                     f"Kimi-K3 tokenizer encoded a user-supplied {token!r} as a control token"
                 )
 
+    # 顺序扫描真实 header，跨过 sep 后开始正文，到 end_of_msg 前结束，返回半开区间 [start,end)。
     def _assistant_spans(self, input_ids: list[int]) -> list[tuple[int, int]]:
         """Return assistant body spans as half-open ``(start, end)`` pairs."""
         spans: list[tuple[int, int]] = []
@@ -249,6 +266,7 @@ class K3Renderer:
             i = body_end + 1
         return spans
 
+    # 只把 assistant 正文标一，不含角色头、sep 或 end_of_msg；可仅保留最后一个区间。
     def compute_loss_mask(
         self,
         input_ids: list[int],
@@ -265,6 +283,7 @@ class K3Renderer:
             loss_mask[start:end] = [1] * (end - start)
         return loss_mask
 
+    # 训练侧通用 matcher 在 header 后立即监督，所以返回的 header 特意包含 sep，避免监督结构分隔符。
     def get_assistant_token_ids(self) -> tuple[list[int], list[int], int]:
         """Return the K3-aware matcher contract for post-vLLM token IDs.
 
@@ -274,8 +293,12 @@ class K3Renderer:
         supervision immediately after its header match, so include ``sep_id``
         in the returned header to keep that structural token masked out.
         """
+        # 假设结构是 [open, assistant, sep, 内容, eom]，静态 span 从 sep 后开始。
+        # 动态 matcher 也必须匹配到 sep 才开始监督，否则会把结构 token 错标为回答内容。
         return [*self.assistant_header_ids, self.sep_id], [self.eom_id], 0
 
+    # 先校验样本生成选项并完整编码、计算 mask，再对两者执行相同右截断。
+    # 先求区间再截断可保留截断点之前的正文监督，并确保 ID 与 mask 长度一致。
     def render(
         self,
         messages: list[dict[str, Any]],

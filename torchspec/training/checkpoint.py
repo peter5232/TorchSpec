@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 训练状态持久化与 warm start：DCP 保存分布式训练状态，safetensors 初始权重用于模型初始化。
+# 恢复训练需匹配 Adam 状态与 FP32 master；continual_training 则保留新超参数并重置训练进度。
+
 from __future__ import annotations
 
 import copy
@@ -41,19 +44,23 @@ from torchspec.utils.logging import logger
 class ModelState(Stateful):
     """Wrapper for model state only."""
 
+    # 保存被 FSDP/replicate 包装的模型引用，作为 DCP Stateful 接口的适配器。
     def __init__(self, model):
         self.model = model
 
+    # 通过分布式 get_state_dict 导出模型状态，而非假设每个 rank 都持有完整普通 tensor。
     def state_dict(self):
         model_state_dict, _ = get_state_dict(self.model, optimizers=[])
         return {"model": model_state_dict}
 
+    # 将 model 字段交给 set_state_dict 恢复模型分布式布局，不触及优化器。
     def load_state_dict(self, state_dict):
         set_state_dict(
             self.model, optimizers=[], model_state_dict=state_dict["model"], optim_state_dict=None
         )
 
 
+# 按 named_parameters 中可训练参数的顺序生成名字，与 BF16Optimizer 的 master 列表一一对应。
 def _fp32_param_names(optimizer) -> list[str]:
     """Names for a ``BF16Optimizer``'s fp32 master copies, in ``fp32_params`` order."""
     return [name for name, param in optimizer.model.named_parameters() if param.requires_grad]
@@ -62,11 +69,14 @@ def _fp32_param_names(optimizer) -> list[str]:
 class OptimizerState(Stateful):
     """Wrapper for optimizer + fp32 master params."""
 
+    # 保存模型/优化器引用，并判断是否使用带独立 FP32 master 的封装，以选择对应序列化方式。
     def __init__(self, model, optimizer):
         self.model = model
         self.optimizer = optimizer
         self._is_bf16_optimizer = hasattr(optimizer, "sync_fp32_params_from_model")
 
+    # BF16 路径额外按参数名保存 master，避免冻结策略改变时仅靠列表位置误配。
+    # 普通优化器则由分布式 get_state_dict 提取优化器状态。
     def state_dict(self):
         if self._is_bf16_optimizer:
             names = _fp32_param_names(self.optimizer)
@@ -82,6 +92,8 @@ class OptimizerState(Stateful):
         _, optimizer_state_dict = get_state_dict(self.model, optimizers=[self.optimizer])
         return {"optim": optimizer_state_dict}
 
+    # 先恢复优化器，再按名字把 master 拷回；若当前可训练参数在快照中缺失则报错。
+    # 参数冻结集合不同的模型不能被当作完全相同的优化器续训，可改走 continual training。
     def load_state_dict(self, state_dict):
         if self._is_bf16_optimizer:
             self.optimizer.load_state_dict(state_dict["optim"])
@@ -113,16 +125,20 @@ class OptimizerState(Stateful):
 class LRSchedulerState(Stateful):
     """Wrapper for LR scheduler state only."""
 
+    # 持有调度器引用，使 DCP 能独立保存学习率计数及配置状态。
     def __init__(self, lr_scheduler):
         self.lr_scheduler = lr_scheduler
 
+    # 把 scheduler.state_dict 放在固定 lr_scheduler 字段中，与模型/优化器目录分离。
     def state_dict(self):
         return {"lr_scheduler": self.lr_scheduler.state_dict()}
 
+    # 将保存的调度状态交还原 scheduler，恢复它的计数和曲线参数。
     def load_state_dict(self, state_dict):
         self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
 
 
+# 读取 JSON 元数据；缺失或 JSON 损坏返回空字典，使兼容路径可用目录步号恢复。
 def _read_checkpoint_metadata(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -133,12 +149,15 @@ def _read_checkpoint_metadata(path: Path) -> dict[str, Any]:
         return {}
 
 
+# 先写相邻临时 JSON 文件，再原子替换目标，避免读者读到半份元数据。
 def _write_checkpoint_metadata(path: Path, metadata: dict[str, Any]) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
     tmp_path.replace(path)
 
 
+# 初始权重路径必须指向现存 .safetensors 或含 model.safetensors 的目录；拼错即失败。
+# 这比可选 resume 路径严格，防止用户以为 warm start 实际却从随机权重训练。
 def resolve_initial_draft_checkpoint(path: str) -> Path:
     """Resolve ``model.initial_draft_model_path`` to the ``model.safetensors`` file it names.
 
@@ -156,6 +175,8 @@ def resolve_initial_draft_checkpoint(path: str) -> Path:
     return checkpoint_path
 
 
+# 转换专家键及裁剪 head；缺失的新 norm/MoE 部分以预定初值补齐。
+# attention norm 变体用堆叠 QKV 的截断 SVD 拆成共享 eh_proj 和窄 Q/K/V，因此不是逐位等价转换。
 @torch.no_grad()
 def _upgrade_to_eagle4(tensors: dict, expected: dict) -> dict:
     """Initialize the EAGLE-4 parts a published EAGLE3 or EAGLE-4 draft does not carry."""
@@ -166,9 +187,12 @@ def _upgrade_to_eagle4(tensors: dict, expected: dict) -> dict:
     # Pruned head: draft row i predicts target token i + d2t[i]; other rows keep the head the
     # trainer seeded from the target.
     if "d2t" in tensors and "d2t" not in expected:
+        # 举例：旧 draft 行 0、1 的 d2t 偏移为 3、6，它们对应 teacher 行 3、7。
+        # 新全词表 head 先保留 expected 中其他行，只覆盖这两行，避免缺失词表随机混入旧 head。
         d2t = tensors.pop("d2t")
         tensors.pop("t2d", None)
         head = expected["lm_head.weight"].clone()
+        # d2t 保存的是偏移而非绝对 token id：draft 行 i 映射到 teacher 行 i+d2t[i]。
         head[torch.arange(len(d2t)) + d2t] = tensors["lm_head.weight"].to(head.dtype)
         tensors["lm_head.weight"] = head
 
@@ -181,6 +205,9 @@ def _upgrade_to_eagle4(tensors: dict, expected: dict) -> dict:
     if eh_proj in expected and eh_proj not in tensors:
         qkv = [f"midlayer.self_attn.{p}_proj.weight" for p in "qkv"]
         sizes = [tensors[k].shape[0] for k in qkv]
+        # 将 Q/K/V 按输出行堆叠，分解为 UΣVh；Vh 前 rank 行作为共享输入投影，
+        # UΣ 前 rank 列按原 Q/K/V 输出行数拆回三个投影。
+        # 若保留 rank 小于矩阵真实秩，这就是低秩近似，warm start 后仍需训练适应。
         u, s, vh = torch.linalg.svd(torch.cat([tensors[k] for k in qkv]).float(), False)
         rank = expected[eh_proj].shape[0]
         tensors[eh_proj] = vh[:rank]
@@ -190,6 +217,8 @@ def _upgrade_to_eagle4(tensors: dict, expected: dict) -> dict:
     # MoE: routed experts keep their no-op init (zero down projections) and a shared expert as
     # wide as the dense MLP takes it over. A latent MoE cannot reuse it and starts fresh.
     dense = [f"layers.0.mlp.{p}_proj.weight" for p in ("gate", "up", "down")]
+    # dense MLP 只在共享专家形状完全匹配时搬过去，路由专家保留构造时的初始化。
+    # latent MoE 结构不一定能承接 dense 权重，因此不能把有同样 gate/up/down 名字理解为形状兼容。
     if "midlayer.mlp.gate.weight" in expected and dense[0] in tensors:
         mlp = {
             k.replace("layers.0.mlp.", "midlayer.mlp.shared_experts."): tensors.pop(k)
@@ -202,6 +231,8 @@ def _upgrade_to_eagle4(tensors: dict, expected: dict) -> dict:
     return tensors
 
 
+# 先读取并映射键，校验新增模块要么完整出现要么全部缺失，再检查所有共享形状。
+# 验证全部通过才 load_state_dict，允许缺失项用构造初值填充，避免错误权重部分写入模型。
 def _load_initial_weights(
     draft_model: torch.nn.Module,
     path: str,
@@ -219,6 +250,8 @@ def _load_initial_weights(
     if upgrade is not None:
         tensors = upgrade(tensors, expected)
 
+    # 新增模块只允许“全部有”或“全部没有”，避免一半层来自 checkpoint、另一半随机初始化。
+    # 例如 selector 有两个参数却只提供一个时必须失败，而不是宽松 strict=False 静默接受。
     present_upgrade = upgrade_keys.intersection(tensors)
     if present_upgrade and present_upgrade != upgrade_keys:
         raise error_type(
@@ -230,6 +263,8 @@ def _load_initial_weights(
         allowed_missing |= upgrade_keys
     missing = set(expected) - set(tensors) - allowed_missing
     unexpected = set(tensors) - set(expected)
+    # 参数名存在也不代表可加载：最后维可能因词表裁剪或层结构变动而改变。
+    # 同时收集 missing/unexpected/shape_mismatch，能在修改模型前一次说明不兼容原因。
     mismatched = {
         key for key in tensors.keys() & expected.keys() if tensors[key].shape != expected[key].shape
     }
@@ -240,6 +275,8 @@ def _load_initial_weights(
             f"shape_mismatch={sorted(mismatched)}"
         )
     # Validate before modifying the model. Retain only explicitly allowed initialization.
+    # 显式合并 expected 与 tensors，再 strict=True 加载：允许的缺失项保留已构造的初值。
+    # 这比对任意缺失键都容忍更可控，日志会列出哪些参数没有从初始权重得到。
     retained = set(expected) - set(tensors)
     draft_model.load_state_dict({**expected, **tensors}, strict=True)
     logger.info(
@@ -251,6 +288,8 @@ def _load_initial_weights(
     return checkpoint_path
 
 
+# 只允许 DFlash2 conv/selector 或 DSpark Markov/confidence 新模块整组缺失。
+# backbone 必须兼容；embedding 允许缺失因为 trainer 会从 teacher 单独加载。
 def load_initial_dflash_weights(draft_model: torch.nn.Module, path: str) -> Path:
     """Warm-start DFlash, DFlash2 or DSpark from a compatible published backbone.
 
@@ -281,6 +320,8 @@ def load_initial_dflash_weights(draft_model: torch.nn.Module, path: str) -> Path
     )
 
 
+# 为 Eagle 允许缺失 fc_norm 和独立加载的 embedding，Eagle4 架构额外经过升级转换。
+# 这是 warm start，不恢复 Adam、scheduler 或步数，也不保证更换结构后输出保持相同。
 def load_initial_draft_weights(draft_model: torch.nn.Module, path: str) -> Path:
     """Load published draft weights, including a compatible EAGLE3 -> 3.1 warm start.
 
@@ -305,6 +346,8 @@ def load_initial_draft_weights(draft_model: torch.nn.Module, path: str) -> Path:
     )
 
 
+# 按 ckpt_step 或 latest tracker 定位 iter_XXXXXXX/model；没有可恢复文件时返回 None。
+# 不能仅根据 load_path 字符串非空就认定权重一定会加载。
 def resolve_resume_model_dir(args: Any) -> Path | None:
     """Model directory ``training.load_path`` resolves to, or None if there is nothing to resume.
 
@@ -336,6 +379,8 @@ def resolve_resume_model_dir(args: Any) -> Path | None:
     return model_dir
 
 
+# 先加载模型，再按续训模式加载优化器、可选 scheduler、RNG 和 metadata 并返回载荷。
+# 模型已恢复而 optimizer 缺失/失败必须终止：旧 FP32 master 会在下一步覆盖已恢复模型。
 def load(actor: Any) -> dict[str, Any] | None:
     """Load checkpoint from disk.
 
@@ -363,6 +408,8 @@ def load(actor: Any) -> dict[str, Any] | None:
         logger.error(f"Failed to load model from {model_dir}: {e}")
         return None
 
+    # 模型权重两种模式都要读取，但 optimizer 和学习率计数的语义不同。
+    # resume 延续同一条优化轨迹；continual training 以旧权重开始新轨迹，不能继续旧 Adam moments。
     continual_training = getattr(actor.args, "continual_training", False)
 
     # Keep optimizer/LR state out of continual training so it starts fresh.
@@ -382,6 +429,8 @@ def load(actor: Any) -> dict[str, Any] | None:
                 "the first optimizer step. Set training.continual_training=true to start a "
                 "fresh optimizer from these weights."
             ) from e
+    # 这是模型已成功恢复、但优化器目录不存在的情形。
+    # 单纯 warning 然后继续会在第一步把构造时 master 的随机值覆盖到模型，因此必须显式失败。
     elif load_optimizer:
         raise RuntimeError(
             f"No optimizer checkpoint at {optimizer_dir}. Resuming without it would leave the "
@@ -407,6 +456,8 @@ def load(actor: Any) -> dict[str, Any] | None:
             f"LR scheduler checkpoint not found at {lr_scheduler_dir}, skipping LR scheduler load."
         )
 
+    # RNG/metadata 先作为载荷返回，最后统一在 finalize_load 应用。
+    # 这避免模型构造或权重加载过程中额外消耗随机数后，误以为 RNG 已精确恢复到训练边界。
     rng_state = None
     rng_path = checkpoint_dir / "rng.pt"
     if rng_path.exists():
@@ -422,6 +473,8 @@ def load(actor: Any) -> dict[str, Any] | None:
     }
 
 
+# continual training 优先从旧 optimizer 取精确 master，但恢复新 param_groups 并清空 Adam moments。
+# 旧优化器不可用时从 BF16 模型同步 master 兜底，此路径有精度损失。
 def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
     """Sync BF16Optimizer's fp32 master params after model-only checkpoint load.
 
@@ -441,6 +494,8 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
 
     if optim_dir.exists() and (optim_dir / ".metadata").exists():
         try:
+            # 暂存的是本次新配置的 group 超参数，排除 params 本身以保留正确 tensor 引用。
+            # 读取旧 optimizer 会覆盖 group 配置，所以稍后必须恢复这些新值，而不是只清 moments。
             fresh_param_groups = [
                 {key: copy.deepcopy(value) for key, value in group.items() if key != "params"}
                 for group in opt.optimizer.param_groups
@@ -453,17 +508,22 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
                 group.clear()
                 group.update(copy.deepcopy(fresh_group))
                 group["params"] = params
+            # continual training 只借旧快照的精确权重；动量/二阶矩必须清空，学习率使用本次新配置。
             opt.optimizer.state.clear()
             logger.info(f"Loaded fp32 master params from {optim_dir}")
             return
         except Exception as e:
             logger.warning(f"Failed to load fp32 params from optimizer checkpoint: {e}")
 
+    # 例如旧 master 某值含 BF16 无法表达的低位，单从 BF16 权重升级 FP32 只会补零扩精度。
+    # 因此此路径能保证下一步不被陈旧 master 覆盖，但无法还原原先 master 的全部数值精度。
     if hasattr(opt, "sync_fp32_params_from_model"):
         opt.sync_fp32_params_from_model()
         logger.info("Synced optimizer fp32 master params from bf16 model weights (lossy)")
 
 
+# 普通续训恢复 RNG/global_step/start_step；continual training 保持新进度并单独同步 master。
+# 最后 CUDA synchronize + barrier，保证所有 rank 恢复完成再进入训练。
 def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None:
     if checkpoint_payload is None:
         dist.barrier()
@@ -496,6 +556,8 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
     dist.barrier()
 
 
+# 所有 rank 集体保存模型、优化器和 scheduler 到独立 DCP 目录，rank 0 写 RNG/元数据/tracker。
+# 目录步号是传入 step+1；tracker 最后写表示这次保存的发布点，首尾 barrier 协调参与者。
 def save(actor: Any, step: int) -> None:
     """Save checkpoint to disk.
 
@@ -505,6 +567,8 @@ def save(actor: Any, step: int) -> None:
     torch.cuda.synchronize()
 
     base_dir = Path(actor.args.checkpoint_dir).expanduser()
+    # 外部 step 可能是 0 起点，目录用下一边界号；metadata 同时保存 step 与 next_step。
+    # 恢复时要看 next_step/global_step 的用途，不能仅把目录编号当作训练过程中所有计数器。
     step_id = step + 1
     checkpoint_dir = base_dir / f"iter_{step_id:07d}"
     model_dir = checkpoint_dir / "model"
@@ -521,6 +585,8 @@ def save(actor: Any, step: int) -> None:
     # Save model weights
     model_state = ModelState(actor.model)
     state_dict = {"model_state": model_state}
+    # DCP 是集体保存：各 rank 写自己的状态/参与元数据协调。
+    # 创建目录可由 rank 0 完成，但真正 dcp.save 不能只让 rank 0 调用。
     dcp.save(state_dict, checkpoint_id=str(model_dir))
 
     if hasattr(actor, "optimizer") and actor.optimizer is not None:
@@ -550,6 +616,8 @@ def save(actor: Any, step: int) -> None:
         }
         _write_checkpoint_metadata(checkpoint_dir / "meta.json", metadata)
 
+        # 模型、optimizer、scheduler、RNG 和 metadata 都写完后才更新 latest tracker。
+        # tracker 给下次启动提供默认恢复入口；显式 ckpt_step 则可以绕过它选择历史目录。
         tracker_file = base_dir / "latest_checkpointed_iteration.txt"
         tracker_file.write_text(str(step_id))
         logger.info(f"Saved checkpoint to {checkpoint_dir}")

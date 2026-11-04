@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 训练共用算子入口：FlexAttention mask、蒸馏损失与 assistant 内容监督 mask。
+# 注意 attention mask 限制可见性，loss mask 限制监督位置，两者不能互换。
 from torchspec.models.ops.flex_attention import (
     build_eagle3_block_mask,
     compile_friendly_create_block_mask,

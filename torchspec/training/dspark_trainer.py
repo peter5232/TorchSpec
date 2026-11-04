@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# DSpark 在 DFlash 管线上接入 Markov/confidence head 和 L1 蒸馏；不另写一套梯度累积循环。
+
 """
 DSpark trainer — DFlash trainer + Markov/confidence heads and L1 distillation.
 
@@ -43,6 +45,7 @@ class DSparkTrainer(DFlashTrainer):
     _draft_config_class = DSparkConfig
     _extra_loss_component_keys = ["ce_loss", "l1_loss", "confidence_loss"]
 
+    # 在父类状态上覆盖 DSpark 的 anchor、目标层和损失权重；预测从槽 0 开始，不跳过首槽。
     def __init__(self, args: Namespace):
         super().__init__(args)
         # DSpark uses its own knobs; override the dflash_* defaults read by the
@@ -60,11 +63,13 @@ class DSparkTrainer(DFlashTrainer):
     # Build hooks (override DFlashTrainer's defaults)
     # ------------------------------------------------------------------
 
+    # K3DSparkConfig 使用专门 K3 网络，其余配置构造普通 DSparkDraftModel。
     def _build_draft_model(self, config):
         if isinstance(config, K3DSparkConfig):
             return K3DSparkModel(config)
         return DSparkDraftModel(config)
 
+    # 把 draft 封装为 DSparkModel，传入 CE/L1/confidence 系数供其构造训练目标。
     def _build_training_wrapper(self, draft_model):
         return DSparkModel(
             draft_model=draft_model,

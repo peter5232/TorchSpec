@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# DeepSeek MLA 版 EAGLE3：注意力输入是归一化 embedding 与隐藏态拼接的 2H 特征。
+# Q/K 的 nope 与 rope 子维、V 的宽度各自独立；训练展开缓存存已展开 K/V，不是服务端压缩 latent cache。
 """DeepSeek MLA (Multi-head Latent Attention) Eagle3 draft model for training."""
 
 import math
@@ -64,6 +66,7 @@ from torchspec.utils.logging import logger, print_with_rank
 # is just cos[..., :half].repeat_interleave(2, dim=-1).
 
 
+# 相邻维成对做 (-x1,x0)，例如 [a,b,c,d]→[-b,a,-d,c]，区别于 Llama 两半互换。
 def _rotate_half_interleaved(x: torch.Tensor) -> torch.Tensor:
     """Interleaved-pair rotation: pairs dims (0,1), (2,3), ..."""
     x1 = x[..., ::2]
@@ -71,6 +74,7 @@ def _rotate_half_interleaved(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
+# 从 NeoX 布局 cos/sin 取前半并 repeat_interleave 成相邻频率对，再按位置旋转 Q/K。
 @torch.compile(dynamic=True)
 def _apply_rotary_pos_emb_interleaved(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     """Apply RoPE with interleaved rotation, accepting neox-layout cos/sin."""
@@ -97,6 +101,8 @@ class DeepSeekMLAAttention(nn.Module):
     Supports both cached (EAGLE3 suffix pattern) and non-cached attention paths.
     """
 
+    # 构造 2H 输入的低秩 Q/KV 投影，KV 压缩结果拆为 latent 和共享 rope 键。
+    # 输出投影输入为 heads*v_head_dim，不是 heads*qk_head_dim；两种宽度不可混用。
     def __init__(self, config: DeepseekV3Config):
         super().__init__()
         self.config = config
@@ -111,6 +117,7 @@ class DeepSeekMLAAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
 
         # Eagle3: attention input is cat(input_emb, hidden_states) = hidden_size * 2
+        # EAGLE 把当前真实 token embedding 与预测 hidden 各 H 维拼接，所以 MLA 入口不是教师模型通常的 H。
         input_dim = self.hidden_size * 2
 
         # Q path
@@ -124,6 +131,7 @@ class DeepSeekMLAAttention(nn.Module):
             self.q_proj = nn.Linear(input_dim, self.num_heads * self.qk_head_dim, bias=False)
 
         # KV path
+        # KV 下投影同时产生压缩 latent 与共享 rope 键，二者在最后维切开后走不同路径。
         self.kv_a_proj_with_mqa = nn.Linear(
             input_dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=False
         )
@@ -135,6 +143,7 @@ class DeepSeekMLAAttention(nn.Module):
         )
 
         # Output projection: v_head_dim per head (NOT qk_head_dim)
+        # attention 输出由 V 决定维度，输出投影必须按 heads*Dv 创建，而非 heads*Dqk。
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
 
         # RoPE on qk_rope_head_dim only
@@ -143,12 +152,14 @@ class DeepSeekMLAAttention(nn.Module):
         # Softmax scale with optional YaRN mscale
         self.softmax_scale = self._compute_softmax_scale()
 
+    # 调用共享 RoPE 构造器，只给 qk_rope_head_dim 分配频率表，nope 维保持未旋转。
     def _init_rope(self):
         """Rotate only the rope side dims, so the cache is built at qk_rope_head_dim."""
         self.rotary_emb = build_rotary_embedding(
             self.config, self.qk_rope_head_dim, self.max_position_embeddings
         )
 
+    # 一般为 1/sqrt(qk_head_dim)，YaRN 时还乘 mscale²，使分数缩放与 RoPE 扩展一致。
     def _compute_softmax_scale(self) -> float:
         """Compute softmax scale, incorporating YaRN mscale if applicable."""
         rope_scaling = self.config.rope_scaling
@@ -162,6 +173,8 @@ class DeepSeekMLAAttention(nn.Module):
                 return (mscale * mscale) / math.sqrt(self.qk_head_dim)
         return 1.0 / math.sqrt(self.qk_head_dim)
 
+    # 返回 Q[B,H,S,Dqk]、K_nope[B,H,S,Dnope]、共享 K_rope[B,1,S,Drope]、V[B,H,S,Dv]。
+    # KV 先低秩归一化再展开到每头，Q 可选择直接投影或低秩两段投影。
     def _project_qkv(
         self, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -176,6 +189,7 @@ class DeepSeekMLAAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Q projection
+        # Q 可以低秩化或直接投影，输出形状最终统一为 [B,H,S,Dqk]，便于后端共享 attention 逻辑。
         if self.q_lora_rank is not None:
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         else:
@@ -183,6 +197,7 @@ class DeepSeekMLAAttention(nn.Module):
         q = q.view(bsz, q_len, self.num_heads, self.qk_head_dim).transpose(1, 2)
 
         # KV down projection + split
+        # KV 压缩张量最后宽度为 Rkv+Drope，切开后仅 Rkv 进入 layernorm/up projection。
         kv_combined = self.kv_a_proj_with_mqa(hidden_states)
         kv_compressed, k_rope_raw = torch.split(
             kv_combined, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -198,10 +213,13 @@ class DeepSeekMLAAttention(nn.Module):
         value = value.transpose(1, 2)
 
         # k_rope: [B, S, rope_dim] -> [B, 1, S, rope_dim]
+        # 共享 rope 键保留 H=1，真正组装完整 K 时再广播到所有 heads，避免此处重复存储。
         k_rope_raw = k_rope_raw.unsqueeze(1)
 
         return q, k_nope, k_rope_raw, value
 
+    # 仅对 Q/K 的 rope 子维用 position_ids+lck 旋转，再广播共享 rope 键并拼回 nope 部分。
+    # lck 表示训练展开深度，不能当作缓存总 token 数。
     def _apply_rope_and_assemble(
         self,
         query_states: torch.Tensor,
@@ -235,6 +253,8 @@ class DeepSeekMLAAttention(nn.Module):
 
         return query_states, key_states
 
+    # 无缓存时走普通 SDPA；有缓存时使用 [B,H,depth,S,D] 布局，首块做因果注意力。
+    # 后续深度只取与 query 同一序列槽的对角键，共用一个 softmax 后再加权所有 V。
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -246,8 +266,10 @@ class DeepSeekMLAAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         bsz, q_len, _ = hidden_states.size()
 
+        # 阶段一：MLA 先压缩再展开，返回的 K 已分 nope/rope 两部分，V 宽度可与 Q/K 不同。
         query_states, k_nope, k_rope_raw, value_states = self._project_qkv(hidden_states)
 
+        # 无缓存分支给标准 SDPA 自己处理因果；有显式 attention_mask 时关闭内置因果，避免两种 mask 重叠。
         if not use_cache:
             query_states, key_states = self._apply_rope_and_assemble(
                 query_states, k_nope, k_rope_raw, position_ids, lck=0
@@ -274,6 +296,7 @@ class DeepSeekMLAAttention(nn.Module):
             )
 
             # Append to 5D tensor cache (K and V have different last dims)
+            # 训练缓存分别保留 [B,H,depth,S,Dqk] 与 [B,H,depth,S,Dv]，不能用单一末维去 reshape 两者。
             if cache_keys is None:
                 cache_keys = key_states.unsqueeze(2)
                 cache_values = value_states.unsqueeze(2)
@@ -290,12 +313,14 @@ class DeepSeekMLAAttention(nn.Module):
             attn_weights = attn_weights + attention_mask
 
             # Suffix diagonal attention on k1..kN
+            # 与普通 GQA EAGLE 相同，只增加同槽链分数；MLA 变化在投影/旋转/scale，不改变训练链拓扑。
             for i in range(1, lck):
                 ki = cache_keys[:, :, i]
                 attn_weightsi = (query_states * ki).sum(-1) * self.softmax_scale
                 attn_weights = torch.cat((attn_weights, attn_weightsi[..., None]), dim=-1)
 
             # Upcast to fp32 for softmax
+            # 前缀三角与 suffix 键统一 softmax，数值尺度使用 MLA 自身 softmax_scale，含 YaRN 时不等于简单 sqrt(head_dim)。
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
                 query_states.dtype
             )
@@ -309,6 +334,7 @@ class DeepSeekMLAAttention(nn.Module):
                 attn_output = attn_output + attn_outputi
 
         attn_output = attn_output.transpose(1, 2).contiguous()
+        # 输出合并的是 V 通道，因此按 heads*Dv 还原，再由 o_proj 回 hidden_size。
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)
 
@@ -326,6 +352,8 @@ class DeepSeekMLAFlexAttention(DeepSeekMLAAttention):
     align to BLOCK_SIZE/Q_LEN, create_block_mask fallback otherwise).
     """
 
+    # 把每深度 S 个键沿序列维追加，以 past_seen_tokens//S 恢复深度。
+    # 用 causal+suffix BlockMask 表达同一训练链，短序列使用 eager flex，长序列使用编译包装。
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -340,6 +368,7 @@ class DeepSeekMLAFlexAttention(DeepSeekMLAAttention):
         query_states, k_nope, k_rope_raw, value_states = self._project_qkv(hidden_states)
 
         # cache_keys shape: [bsz, num_heads, past_seq_len, qk_head_dim] (concatenated along seq)
+        # Flex 把轮维展平到序列维，深度由缓存总长度除当前 q_len 得到；与 SDPA 五维布局只在存储上不同。
         past_seen_tokens = cache_keys.shape[2] if cache_keys is not None else 0
         lck = past_seen_tokens // q_len
 
@@ -357,6 +386,7 @@ class DeepSeekMLAFlexAttention(DeepSeekMLAAttention):
 
         flex_attention_func = flex_attention if q_len <= 128 else compile_friendly_flex_attention
 
+        # 复用与 GQA 同样的 causal+suffix mask；MLA 不需要额外改变哪些 token 可以互看。
         block_mask = eagle3_block_mask(
             Q_LEN=q_len,
             KV_LEN=key_cache.shape[-2],
@@ -366,6 +396,7 @@ class DeepSeekMLAFlexAttention(DeepSeekMLAAttention):
             lck=lck,
         )
 
+        # Q/K 的 rope/nope 已拼好，V 保持自己的宽度；kernel 同时接收显式 MLA scale。
         attn_output = flex_attention_func(
             query=query_states,
             key=key_cache.contiguous(),
@@ -382,6 +413,7 @@ class DeepSeekMLAFlexAttention(DeepSeekMLAAttention):
 
 
 class DeepSeekDecoderLayer(nn.Module):
+    # 选择 SDPA 或 Flex MLA，建立 embedding/hidden 两路 norm 和残差 MLP；其他后端明确拒绝。
     def __init__(self, config: DeepseekV3Config, attention_backend: str = "sdpa"):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -403,6 +435,7 @@ class DeepSeekDecoderLayer(nn.Module):
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    # 分别 norm embedding 与 hidden 后拼成 2H 给 MLA，注意力输出加原 hidden，再经 pre-norm MLP 残差。
     def forward(
         self,
         input_emb: torch.Tensor,
@@ -446,6 +479,8 @@ class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
 
     config_class = DeepseekV3Config
 
+    # 建立教师多层特征融合、MLA 单层骨干和 final norm/head；裁剪词表时注册映射缓冲。
+    # 输入 embedding 仍使用 target 全词表，即使输出 draft 词表较小。
     def __init__(self, config: DeepseekV3Config, attention_backend: str = "sdpa") -> None:
         super().__init__(config)
 
@@ -454,10 +489,12 @@ class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.midlayer = DeepSeekDecoderLayer(config, attention_backend=attention_backend)
 
+        # 多层教师融合宽度单独由 target_hidden_size 控制，不能从 MLA 的压缩秩或 head_dim 推断。
         target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
         self.fc = nn.Linear(
             target_hidden_size * self.num_aux_hidden_states, config.hidden_size, bias=False
         )
+        # 可选逐捕获层归一化在拼接前完成，之后 fc 才融合多层信息。
         use_fc_norm = getattr(config, "fc_norm", None)
         if use_fc_norm:
             self.fc_norm = nn.ModuleList(
@@ -475,6 +512,7 @@ class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
             config, config.hidden_size, self.vocab_size, self.target_vocab_size
         )
 
+        # 输出裁剪只改变 head 的行数与目标分布；输入 embedding 仍覆盖教师完整词表。
         if self.vocab_size != self.target_vocab_size:
             self.register_buffer("t2d", torch.ones(self.target_vocab_size, dtype=torch.bool))
             self.register_buffer("d2t", torch.zeros(self.vocab_size, dtype=torch.int64))
@@ -489,9 +527,11 @@ class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
             f"vocab={self.vocab_size}/{self.target_vocab_size}"
         )
 
+    # 查 target 词表 embedding，返回 [B,T,H] 供每个展开深度融合。
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    # 验证最后维等于融合投影输入宽度，可逐路 RMSNorm，再用 fc 压缩到 draft hidden_size。
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         expected_size = self.fc.in_features
         if hidden_states.size(-1) != expected_size:
@@ -506,10 +546,12 @@ class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
             )
         return self.fc(hidden_states)
 
+    # 对层残差输出做 final norm，再执行 dense/low-rank 输出头，返回 draft 词表分数。
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         norm_hidden_states = self.norm(hidden_states)
         return self.lm_head(norm_hidden_states)
 
+    # 将统一训练接口参数原样传给 midlayer，返回隐藏态与后端布局的缓存，避免包装层重复归一化。
     def backbone(
         self,
         input_embeds: torch.Tensor,

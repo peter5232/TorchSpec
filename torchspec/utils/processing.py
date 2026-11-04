@@ -18,16 +18,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# Tokenizer 与 assistant 边界适配：为 loss mask 提供与实际 renderer/chat template 一致的 token 标记。
+
 from transformers import AutoTokenizer
 
 from torchspec.utils.logging import logger
 
 
+# 默认使用 fast tokenizer，但保留调用方显式 use_fast 值及其他参数，返回 Hugging Face tokenizer。
 def load_tokenizer(name_or_path: str, **kwargs):
     kwargs.setdefault("use_fast", True)
     return AutoTokenizer.from_pretrained(name_or_path, **kwargs)
 
 
+# renderer 优先提供精确边界；否则按 chat template 编码 assistant header 与结束标记。
+# 去掉 header 尾换行后匹配，再返回需要跳过的换行 token 数，避免 BPE 把连续换行合并导致匹配失败。
+# 没有可用模板边界时返回 (None,None,0)，由 mask 解析方决定后续策略。
 def get_assistant_token_ids(
     args,
 ) -> tuple[list[int] | None, list[int] | None, int]:
@@ -42,6 +48,8 @@ def get_assistant_token_ids(
     from torchspec.data.renderers import RENDERER_REGISTRY
     from torchspec.data.template import TEMPLATE_REGISTRY
 
+    # renderer 可能包含模型特定的角色格式，优先向它询问边界，避免用通用模板猜 token 序列。
+    # 若 renderer 没实现匹配接口或返回空边界，显式失败比生成错误监督 mask 更安全。
     renderer_name = getattr(args, "renderer", None)
     if renderer_name:
         tokenizer = load_tokenizer(args.target_model_path, trust_remote_code=True)
@@ -74,6 +82,9 @@ def get_assistant_token_ids(
 
     tokenizer = load_tokenizer(args.target_model_path, trust_remote_code=True)
 
+    # 分别编码完整 header 和去尾换行的 header，利用长度差估计需要跳过的格式 token。
+    # 例如正文以换行开头，BPE 可能把 header 末尾换行与正文换行合并，
+    # 直接匹配完整 header token 会失败；匹配不含尾换行的核心角色标记更稳定。
     full_ids = tokenizer.encode(template.assistant_header, add_special_tokens=False)
     header_text = template.assistant_header.rstrip("\n")
     stripped_ids = tokenizer.encode(header_text, add_special_tokens=False)

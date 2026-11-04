@@ -18,6 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：推理后端的配置边界。TP 是把一个模型的张量计算分到多卡，PP 是把层分成多个阶段；
+# 它们与训练侧 DP（多个副本处理不同数据）不是同一个维度。extra_args 保留引擎特有选项，
+# 公共字段则用于资源分配、特征采集和调度。字段最终如何传递需跟到 inference/factory.py。
+
 """Inference configuration classes.
 
 SGLangConfig exposes only the fields that TorchSpec actually references.
@@ -34,6 +38,7 @@ from omegaconf import DictConfig
 from torchspec.config.mooncake_config import MooncakeConfig
 
 
+# SGLang 的并行规模、静态显存比例、启动通信与多模态设置；未列出的引擎参数经 extra_args 传递。
 @dataclass
 class SGLangConfig:
     """Essential SGLang engine configuration.
@@ -69,6 +74,8 @@ class SGLangConfig:
     extra_args: Dict[str, Any] = field(default_factory=dict)
 
 
+# vLLM 特征采集配置；静态显存比例为 None 时引擎可根据 connector 额外开销推导。
+# 不能直接把 TP/PP 当作独立副本数，它们共同运行一份目标模型。
 @dataclass
 class VllmConfig:
     """Essential vLLM engine configuration.
@@ -107,6 +114,8 @@ class VllmConfig:
     extra_args: Dict[str, Any] = field(default_factory=dict)
 
 
+# TensorRT-LLM SaveHiddenStates 路径的配置，目前仅接通单节点 TP。
+# mem_fraction_static 对应 KV cache 的可用显存比例，与其他引擎同名参数的分配对象并非完全相同。
 @dataclass
 class TrtllmConfig:
     """Essential TensorRT-LLM engine configuration.
@@ -135,6 +144,7 @@ class TrtllmConfig:
     extra_args: Dict[str, Any] = field(default_factory=dict)
 
 
+# 当前集成面向单节点 eager prefill 特征采集；TP 的实际资源数由每引擎 GPU 配置派生。
 @dataclass
 class TokenSpeedConfig:
     """TokenSpeed offline hidden-state inference configuration.
@@ -150,6 +160,7 @@ class TokenSpeedConfig:
     extra_args: Dict[str, Any] = field(default_factory=dict)
 
 
+# 回放模式只需磁盘目录和读取引擎数；这些引擎搬运已有特征，不运行目标模型。
 @dataclass
 class OfflineTrainingConfig:
     """Configuration for training from materialized target outputs."""
@@ -158,6 +169,7 @@ class OfflineTrainingConfig:
     num_engines: int = 1
 
 
+# 跨后端的采集和缓冲配置；辅助层用于草稿输入，最后一层 hidden state 可用于重建 teacher logits。
 @dataclass
 class InferenceConfig:
     aux_hidden_states_layers: Optional[list] = None
@@ -179,6 +191,8 @@ class InferenceConfig:
     trtllm: TrtllmConfig = field(default_factory=TrtllmConfig)
     tokenspeed: TokenSpeedConfig = field(default_factory=TokenSpeedConfig)
 
+    # 明确配置优先；否则仅 vLLM 默认视为 final norm 前的特征。
+    # 如果把 pre-norm 特征直接乘 lm_head，会改变 teacher 分布；因此这不是无关紧要的元信息。
     def resolve_last_hidden_states_prenorm(self) -> bool:
         """Whether last_hidden_states from the engine are pre-norm.
 
@@ -190,6 +204,7 @@ class InferenceConfig:
         return self.inference_engine_type == "vllm"
 
 
+# 直接调用 Transformers 模型所需的紧凑配置；包含模型、精度、层索引和可选存储连接。
 @dataclass
 class HFInferenceConfig:
     """Configuration for HFRunner."""
@@ -202,6 +217,7 @@ class HFInferenceConfig:
     mooncake_config: Optional[MooncakeConfig] = None
 
 
+# 提前拒绝非正批大小；零批次会导致调度看似运行却永远不产出训练样本。
 def _validate_inference_batch_config(config: DictConfig) -> None:
     if config.inference.inference_batch_size <= 0:
         raise ValueError(

@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 教师侧公共协议：生成指定层隐藏态的数据后端，以及训练端只加载的冻结 LM head。
+# 完整教师推理与轻量词表投影分离，避免在训练 rank 上复制整个大模型。
 from torchspec.models.target.eagle3_target_model import (
     Eagle3TargetModel,
     Eagle3TargetOutput,

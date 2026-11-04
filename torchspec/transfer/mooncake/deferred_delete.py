@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 提供遵守对象租约 TTL 的后台延迟删除器，使用有界新任务队列和失败重试列表。
+# 当前 EagleMooncakeStore 消费清理采用 force=True 直接删除；不要把本模块误认为每次 get 的必经步骤。
+
 """Deferred deletion manager for Mooncake objects with lease TTL."""
 
 import queue
@@ -29,6 +32,7 @@ from typing import Any, Dict, List
 from torchspec.utils.logging import logger
 
 
+# 一组待删除键的重试状态：入队时间用于租约等待，最近尝试时间用于重试间隔，attempts 限制总尝试次数。
 @dataclass
 class DeleteTask:
     """A deferred deletion task."""
@@ -41,6 +45,7 @@ class DeleteTask:
     max_attempts: int = 3  # Maximum retry attempts
 
 
+# 把可能需要等待 TTL 的删除移出数据消费线程，并累计任务级别的成功、重试和放弃计数。
 class DeferredDeleteManager:
     """Manages deferred deletions with TTL awareness and retry logic.
 
@@ -48,6 +53,7 @@ class DeferredDeleteManager:
     This manager queues deletions and processes them after the TTL expires.
     """
 
+    # 创建有界队列、统计锁和停止事件，然后启动守护线程；构造对象已经产生后台执行副作用。
     def __init__(
         self,
         store: Any,
@@ -99,6 +105,7 @@ class DeferredDeleteManager:
             check_interval,
         )
 
+    # 以当前时间创建任务并非阻塞入队；队列满返回 False，调用方据此知道回收请求未被接受。
     def enqueue_delete(
         self,
         keys: List[str],
@@ -132,6 +139,7 @@ class DeferredDeleteManager:
             logger.error("Queue full! Cannot enqueue deletion for %s", base_key)
             return False
 
+    # 每轮先看重试，再从新队列取任务；空队列正常轮询，意外异常记录后短暂退避。
     def _worker_loop(self):
         """Background worker that processes deletions."""
         logger.info("Worker thread started")
@@ -154,6 +162,7 @@ class DeferredDeleteManager:
 
         logger.info("Worker thread stopped")
 
+    # 从入队时刻算起等待 TTL 加缓冲时间，再执行删除；这不是查询对象创建时间，而是保守的额外等待。
     def _process_task(self, task: DeleteTask):
         """Process a single deletion task."""
         current_time = time.time()
@@ -174,6 +183,7 @@ class DeferredDeleteManager:
         # Attempt deletion
         self._attempt_delete(task)
 
+    # 检查每项距离上次尝试的时间，只重试达到间隔者，未到期的留待后续轮询。
     def _process_retry_queue(self):
         """Process tasks in the retry queue."""
         if not self.retry_queue:
@@ -191,11 +201,13 @@ class DeferredDeleteManager:
 
         self.retry_queue = still_waiting
 
+    # 逐键删除并把已不存在当成功；只把失败键保留到下次任务，达到最大尝试数后记录放弃。
     def _attempt_delete(self, task: DeleteTask):
         """Attempt to delete keys for a task."""
         task.attempts += 1
         task.last_attempt_time = time.time()
 
+        # 尝试次数按任务计数，而不是按每个键计数；第二次及以后同时增加 retried。
         with self.stats_lock:
             self.stats["attempted"] += 1
             if task.attempts > 1:
@@ -211,6 +223,7 @@ class DeferredDeleteManager:
         removed_count = 0
         failed_keys = []
 
+        # 一组字段可能部分已删除，逐键统计并把失败原因保留下来；-704 说明目标已经不存在，无需再重试。
         for key in task.keys:
             try:
                 result = self.store.remove(key)
@@ -234,6 +247,7 @@ class DeferredDeleteManager:
                 failed_keys.append((key, error_msg))
 
         # Check results
+        # 只有本次剩余键全部完成才算任务成功；部分失败会缩小下一次需要删除的键集合。
         if removed_count == len(task.keys):
             # Complete success
             with self.stats_lock:
@@ -257,12 +271,14 @@ class DeferredDeleteManager:
                     task.max_attempts,
                 )
                 # Update task to only retry failed keys
+                # 已经删除的字段不重复入队，避免大样本某一个键失败时反复操作其他字段。
                 task.keys = [key for key, _ in failed_keys]
                 self.retry_queue.append(task)
             else:
                 # Exceeded max attempts
                 with self.stats_lock:
                     self.stats["failed"] += 1
+                    # 达到上限就放弃当前任务，不无限占用后台线程；遗留对象的清理只能依赖后续管理措施。
                     self.stats["abandoned"] += 1
                 logger.error(
                     "Abandoned deletion for %s after %d attempts: %d keys still failed",
@@ -274,15 +290,18 @@ class DeferredDeleteManager:
                 for key, error in failed_keys[:5]:  # Show first 5
                     logger.error("Failed key: %s (%s)", key, error)
 
+    # 持锁复制统计字典，调用者不会拿到可直接修改内部计数的对象。
     def get_stats(self) -> Dict[str, int]:
         """Get deletion statistics."""
         with self.stats_lock:
             return self.stats.copy()
 
+    # 将新任务队列和重试列表长度相加，提供近似待回收积压量，不是尚未删除的对象字节数。
     def get_queue_size(self) -> int:
         """Get current queue size."""
         return self.delete_queue.qsize() + len(self.retry_queue)
 
+    # 设置退出信号并最多等待十秒线程结束，记录最终统计；这不是保证清空所有剩余删除任务的 drain。
     def stop(self):
         """Stop the worker thread."""
         logger.info("Stopping worker thread...")
@@ -300,6 +319,7 @@ class DeferredDeleteManager:
             self.get_queue_size(),
         )
 
+    # 析构时仅在后台线程存在且仍运行时请求停止，处理可能的部分初始化状态。
     def __del__(self):
         """Cleanup on deletion."""
         if hasattr(self, "_worker_thread") and self._worker_thread.is_alive():

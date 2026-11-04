@@ -1,3 +1,6 @@
+# 将训练 DCP 权重整理成推理可加载的 safetensors/config，并可分析或裁剪 draft 输出词表。
+# 转换不跑训练前向，但会完整加载模型权重、写文件；目标模型或数据集可触发下载和缓存。
+
 """
 Convert FSDP checkpoint to HuggingFace format with optional vocabulary pruning.
 
@@ -73,6 +76,7 @@ logger = logging.getLogger(__name__)
 _VERSION_FILE = os.path.join(os.path.dirname(__file__), "..", "version.txt")
 
 
+# 读取仓库版本文本作为导出元数据，文件不可读时使用 unknown，不阻止权重转换。
 def _get_torchspec_version() -> str:
     try:
         with open(_VERSION_FILE) as f:
@@ -84,10 +88,14 @@ def _get_torchspec_version() -> str:
 # ── FSDP loading helpers ─────────────────────────────────────────────────────
 
 
+# 读取历史 DCP 元数据时兼容不可用的旧类路径；不是任意不可信 pickle 的安全加载器。
 class _UnpicklerWrapper(pickle.Unpickler):
+    # 对 megatron/glm 开头的模块返回占位类，其余仍走普通 pickle 类解析，保留必要的标准元数据类型。
     @override
     def find_class(self, mod_name, name):
+        # 旧框架类的无行为占位，作用是允许解释检查点元数据而无需安装对应框架。
         class DummyClass:
+            # 接受任意历史构造参数但不执行逻辑，实际张量内容由 DCP storage reader 读取。
             def __init__(self, *args, **kwargs):
                 pass
 
@@ -96,7 +104,9 @@ class _UnpicklerWrapper(pickle.Unpickler):
         return super().find_class(mod_name, name)
 
 
+# 替换 DCP 元数据反序列化，并补齐不同 PyTorch 版本间可能缺失的存储/规划字段。
 class _WrappedStorageReader(dist_cp.FileSystemReader):
+    # 读取 .metadata 后设置本次 load_id；没有 planner_data 时补空字典，交给后续 planner 分配张量。
     @override
     def read_metadata(self):
         path = self.fs.concat_path(self.path, ".metadata")
@@ -110,7 +120,9 @@ class _WrappedStorageReader(dist_cp.FileSystemReader):
         return metadata
 
 
+# 无需先构造模型 state_dict，按检查点元数据建立目标容器；跳过 optimizer 降低不必要的主机内存占用。
 class _EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
+    # 每个 TensorStorageMetadata 按原 shape/dtype 分配完整 CPU 张量，再交父类制定分片加载计划。
     @override
     def set_up_planner(
         self,
@@ -133,10 +145,13 @@ class _EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
 # vLLM / SGLang supports a different naming convention for some weight keys.
 
 
+# 按共享前缀映射改成服务端键名，之后拆分 latent experts；重命名与专家权重结构转换是两个步骤。
 def _remap_weight_keys(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     remapped = {}
     for k, v in tensors.items():
         new_key = k
+        # 例如 context_proj.weight→fc.weight，midlayer.self_attn.*→layers.0.self_attn.*。
+        # 只是键名变化，线性层 [out_features, in_features] 的维度方向不因此转置。
         for old_prefix, new_prefix in DRAFT_WEIGHT_KEY_REMAP:
             if k.startswith(old_prefix):
                 new_key = new_prefix + k[len(old_prefix) :]
@@ -151,6 +166,7 @@ _MODEL_TYPE_REMAP = {
 }
 
 
+# 深拷贝配置后处理 Kimi 的 vLLM 层索引、DFlash2 服务配置和模型类型别名，不修改调用方原字典。
 def _fixup_export_config(raw_config: dict, export_for_vllm: bool = False) -> dict:
     """Apply model-type-specific fixups to the exported config."""
     config = json.loads(json.dumps(raw_config))
@@ -176,11 +192,13 @@ def _fixup_export_config(raw_config: dict, export_for_vllm: bool = False) -> dic
 # ── Core conversion ─────────────────────────────────────────────────────────
 
 
+# 如果输入目录下存在 model 子目录就进入它，否则把输入本身当 DCP 目录。
 def _detect_model_dir(input_dir: str) -> str:
     model_dir = os.path.join(input_dir, "model")
     return model_dir if os.path.isdir(model_dir) else input_dir
 
 
+# 从 teacher 配置生成 draft 配置，关闭 embedding 绑定并补齐 draft 词表大小，再写到指定位置。
 def _generate_config_from_target(
     target_model_path: str, output_path: str, trust_remote_code: bool = False
 ) -> str:
@@ -203,6 +221,7 @@ def _generate_config_from_target(
     return output_path
 
 
+# 优先显式配置，其次输入目录 config.json，再尝试从 target 自动生成；缺少全部来源则报错。
 def _resolve_config_path(
     input_dir: str,
     config_arg: Optional[str],
@@ -222,6 +241,7 @@ def _resolve_config_path(
     )
 
 
+# 用自定义 reader/planner 在单进程 CPU 上合并 DCP 分片；no_dist 不等于无需足够主机内存。
 def _load_fsdp_state_dict(input_dir: str) -> dict[str, torch.Tensor]:
     state_dict: dict[str, torch.Tensor] = {}
     dist_cp.state_dict_loader._load_state_dict(
@@ -233,6 +253,7 @@ def _load_fsdp_state_dict(input_dir: str) -> dict[str, torch.Tensor]:
     return state_dict
 
 
+# 只保留含 draft_model. 的张量并去包装前缀，排除 t2d/d2t；非 draft tensor 记数供检查。
 def _extract_model_weights(
     state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
@@ -261,6 +282,7 @@ def _extract_model_weights(
     return model_state
 
 
+# 优先调用模型自带的服务权重导出方法，否则使用通用前缀映射和专家拆分；不同架构可能需要不同权重布局。
 def _prepare_export_tensors(hf_model) -> dict[str, torch.Tensor]:
     tensors = hf_model.state_dict()
     if hasattr(hf_model, "state_dict_for_serving"):
@@ -270,6 +292,7 @@ def _prepare_export_tensors(hf_model) -> dict[str, torch.Tensor]:
     return _remap_weight_keys(tensors)
 
 
+# 保存完整词表权重和修正后的 config，记录真实 dtype 与代码版本，不新建词表映射。
 def _save_without_vocab_pruning(
     hf_model, output_dir: str, raw_config: dict, vocab_size: int, export_for_vllm: bool = False
 ) -> None:
@@ -296,6 +319,8 @@ def _save_without_vocab_pruning(
     )
 
 
+# 意图保存 t2d/d2t 并按 d2t 选择完整 lm_head 的行，拒绝因子化头和已裁剪头被重新裁剪。
+# 当前调用 _prepare_export_tensors 多传一个参数，与其定义不一致；这是既有路径限制，此注释不改变行为。
 def _save_with_vocab_pruning(
     hf_model,
     output_dir: str,
@@ -307,6 +332,7 @@ def _save_with_vocab_pruning(
     export_for_vllm: bool = False,
 ) -> None:
     tensors = _prepare_export_tensors(hf_model, export_for_vllm)
+    # 映射编码应以预处理实现为准：t2d 是完整词表的布尔成员表，d2t 是目标 ID 减 draft 列号的偏移。
     tensors["t2d"] = t2d
     tensors["d2t"] = d2t
 
@@ -327,7 +353,10 @@ def _save_with_vocab_pruning(
                 current_size,
                 draft_vocab_size,
             )
+            # 注意当前代码把 d2t 直接当行号，但生成函数返回的是偏移编码。
+            # 例如目标 ID [2,5,9] 对应 d2t=[2,4,7]，直接索引将选错行；此处保留原行为，仅提示阅读时核对契约。
             tensors[lm_head_key] = tensors[lm_head_key][d2t]
+        # 已裁剪头的每行语义绑定训练时映射；不能换一份数据重算 token 频次后只改映射而不重新对应权重。
         elif current_size == draft_vocab_size:
             raise ValueError(
                 f"lm_head is already pruned to draft_vocab_size ({current_size}). "
@@ -352,6 +381,7 @@ def _save_with_vocab_pruning(
     )
 
     export_config = _fixup_export_config(raw_config, export_for_vllm=export_for_vllm)
+    # 配置的输出列数必须与实际保存头的行数一致；权重文件和映射/config 是一组不可独立替换的产物。
     export_config["draft_vocab_size"] = draft_vocab_size
     export_config["_torchspec_version"] = version
     actual_dtype = next(iter(tensors.values())).dtype
@@ -369,6 +399,7 @@ def _save_with_vocab_pruning(
     )
 
 
+# 只统计 loss mask 为 1 的 token，优先使用展开 mask，其次解码 packed mask，否则统计所有位置。
 def _count_token_frequencies(prompts: list[dict]) -> Counter:
     """Count token frequencies from tokenized prompts using packed_loss_mask."""
     import numba
@@ -376,6 +407,7 @@ def _count_token_frequencies(prompts: list[dict]) -> Counter:
 
     from torchspec.data.utils import unpack_loss_mask
 
+    # Numba 循环对每个有效监督位置累加 token 计数；同一 token 多次出现按次数计，不是只计存在与否。
     @numba.njit(cache=True)
     def _histogram(ids, mask, counts):
         for i in range(len(ids)):
@@ -387,6 +419,7 @@ def _count_token_frequencies(prompts: list[dict]) -> Counter:
     for item in tqdm(prompts, desc="Preparing token data"):
         input_ids = item["input_ids"].squeeze()
 
+        # 只统计监督位置：例如 token=[2,5,2]、mask=[0,1,1]，计数是 5→1、2→1，而非 2→2。
         if "loss_mask" in item and item["loss_mask"] is not None:
             loss_mask = item["loss_mask"].squeeze()
         elif "packed_loss_mask" in item and item["packed_loss_mask"] is not None:
@@ -397,6 +430,7 @@ def _count_token_frequencies(prompts: list[dict]) -> Counter:
         all_ids.append(input_ids.numpy().astype(np.int64))
         all_masks.append(loss_mask.numpy().astype(np.int64))
 
+    # 把所有样本展平成主机数组后一次统计，速度较快但会额外占用与 token 总数成正比的 CPU 内存。
     flat_ids = np.concatenate(all_ids)
     flat_masks = np.concatenate(all_masks)
 
@@ -407,6 +441,7 @@ def _count_token_frequencies(prompts: list[dict]) -> Counter:
     return Counter(dict(zip(nonzero.tolist(), counts[nonzero].tolist())))
 
 
+# 构造与训练加载器兼容的参数并复用其分词缓存，统计的长度和模板应与实际训练一致。
 def _load_tokenized_prompts(
     dataset_path: str,
     tokenizer: str,
@@ -429,6 +464,7 @@ def _load_tokenized_prompts(
     return load_conversation_dataset(args_ns)
 
 
+# 把频次降序累加，报告前 N 个 token 覆盖的监督位置比例；覆盖率不是 speculative decoding 接受率。
 def _analyze_vocab_coverage(
     token_dict: Counter,
     vocab_size: int,
@@ -473,6 +509,8 @@ def _analyze_vocab_coverage(
     )
 
 
+# 加载模型与 DCP、匹配 draft 权重、可选替换 teacher embedding 和精度，再选择全词表或裁剪导出。
+# weighted_low_rank 还生成逐 token 频次数组；DFlash2 的 selector 依赖完整 token ID，拒绝词表裁剪。
 def _convert_fsdp_to_hf(
     config_path: str,
     input_dir: str,
@@ -511,6 +549,7 @@ def _convert_fsdp_to_hf(
 
     hf_model = AutoEagle3DraftModel.from_config(config)
 
+    # 先按检查点主精度实例化目标模型，再 load 权重，最后按用户要求转输出精度，避免过早降精度。
     ckpt_dtype = Counter(v.dtype for v in model_state.values()).most_common(1)[0][0]
     final_dtype = output_dtype or ckpt_dtype
     logger.info("Checkpoint dtype: %s, output dtype: %s", ckpt_dtype, final_dtype)
@@ -518,6 +557,7 @@ def _convert_fsdp_to_hf(
 
     if config.model_type == "qwen3_dflash2":
         missing, unexpected = hf_model.load_state_dict(model_state, strict=False)
+        # DFlash2 对缺失键更严格；只有计划从 teacher 补 embedding 时才允许这一项缺失。
         allowed_missing = {"embed_tokens.weight"} if target_model_path else set()
         invalid_missing = sorted(set(missing) - allowed_missing)
         if invalid_missing or unexpected:
@@ -534,6 +574,7 @@ def _convert_fsdp_to_hf(
 
     # Optionally override embed_tokens from target model.
     # Useful for older checkpoints where embed_tokens may not have been saved correctly.
+    # 从 teacher 补回 embedding 会覆盖模型已有 embedding；不是单纯转换文件格式而保持所有值不变。
     if target_model_path:
         logger.info("Loading embed_tokens from target model: %s", target_model_path)
         embed_key = embedding_key + ".weight"
@@ -561,6 +602,7 @@ def _convert_fsdp_to_hf(
     vocab_size = raw_config["vocab_size"]
     config_draft_vocab_size = raw_config.get("draft_vocab_size") or vocab_size
 
+    # 低秩加权头需要频率权重，保存 token_frequency.npy 供服务端按训练数据分布处理 SVD。
     if (raw_config.get("efficient_lm_head_config") or {}).get("type") == "weighted_low_rank":
         # SGLang's EAGLE-4 loader weights the efficient lm_head SVD by per-token counts it
         # reads from token_frequency.npy beside the weights.
@@ -618,6 +660,7 @@ def _convert_fsdp_to_hf(
         sum(token_dict.values()),
     )
 
+    # 频次决定入选集合，再按 token ID 排列；读者需确认下游索引理解了成员表/偏移编码，不能只照变量名猜。
     d2t, t2d = process_token_dict_to_mappings(token_dict, draft_vocab_size, vocab_size)
     _save_with_vocab_pruning(
         hf_model,
@@ -631,6 +674,7 @@ def _convert_fsdp_to_hf(
     )
 
 
+# 声明输入输出、服务后端格式、精度、词表分析/裁剪及数据分词参数；这里只解析，不加载权重。
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert FSDP checkpoint to HuggingFace format with optional vocabulary pruning"
@@ -751,6 +795,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# 分析/裁剪必须提供数据、tokenizer、模板，裁剪另需目标大小；模板名必须已注册。
 def _validate_args(args: argparse.Namespace) -> None:
     if args.analyze_vocab or args.prune_vocab:
         if not args.dataset_path:

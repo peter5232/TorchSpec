@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# DSpark 的 Markov 偏置和接受率预测头；K3 变体用 MLA 替换 DFlash 的 GQA。
+# 损失和 teacher forcing 位移在上一级 dspark.py，本文件只定义可训练参数及前向计算。
 """
 DSpark draft model: DFlash backbone + EAGLE-style Markov and confidence heads.
 
@@ -61,6 +63,7 @@ class DSparkConfig(DFlashConfig):
 
     model_type = "qwen3_dspark"
 
+    # 在 DFlash 配置上增加 Markov 秩、类型和 confidence 开关，决定新增头的尺寸。
     def __init__(
         self,
         markov_rank: int = 256,
@@ -81,6 +84,7 @@ class VanillaMarkov(nn.Module):
     Adapted from DeepSpec's ``deepspec/modeling/dspark/markov_head.py``.
     """
 
+    # 用 [V,R] embedding 和 R→V 投影分解 token bigram 偏置，参数量从 V² 降到约 2VR。
     def __init__(self, *, vocab_size: int, markov_rank: int):
         super().__init__()
         self.vocab_size = int(vocab_size)
@@ -93,15 +97,19 @@ class VanillaMarkov(nn.Module):
         # TODO: markow_w2 out_features should match "draft_vocab_size" if pruning is used.
         self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
 
+    # 将真实前驱 token id 转 long 并查低秩码本，保留任意前导 batch/块维。
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
 
+    # 把前驱低秩特征投影到整个输出词表，得到可以直接加到基础 logits 的偏置。
     def project_bias(self, latent_states: torch.Tensor) -> torch.Tensor:
         return self.markov_w2(latent_states)
 
+    # 串联前驱查表与词表投影，计算条件于前一个 token 的 bigram 分数。
     def compute_step_bias(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.project_bias(self.get_prev_embeddings(token_ids))
 
+    # 空预测维直接返回，否则把逐槽前驱偏置加到 [B,N,K,V] 基础 logits。
     def apply_block_logits(
         self,
         base_logits: torch.Tensor,
@@ -118,14 +126,17 @@ class AcceptRatePredictor(nn.Module):
     Adapted from DeepSpec's ``deepspec/modeling/dspark/common.py``.
     """
 
+    # 建立 input_dim→1 带偏置线性头；输入可为 hidden，也可拼接 Markov 前驱特征。
     def __init__(self, input_dim: int):
         super().__init__()
         self.proj = nn.Linear(int(input_dim), 1)
 
+    # 移除最后的单通道维，返回每预测槽一个 logit；sigmoid 由 BCEWithLogits 在 loss 内处理。
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.proj(features).squeeze(-1)
 
 
+# rank=0 表示不建 Markov 头，正 rank 当前仅实现 vanilla，其他类型显式报错。
 def build_markov_head(config) -> Optional[nn.Module]:
     markov_rank = int(getattr(config, "markov_rank", 0))
     assert markov_rank >= 0, f"markov_rank must be >= 0, got {markov_rank}"
@@ -144,6 +155,7 @@ def build_markov_head(config) -> Optional[nn.Module]:
 class DSparkDraftModel(DFlashDraftModel):
     config_class = DSparkConfig
 
+    # 创建可选 Markov/confidence 头；若置信度要拼接 Markov 特征，则强制存在 Markov 头并增加输入维度。
     def __init__(self, config: DSparkConfig):
         super().__init__(config)
 
@@ -169,6 +181,8 @@ class DSparkDraftModel(DFlashDraftModel):
 class K3DSparkConfig(DSparkConfig):
     model_type = "k3_dspark"
 
+    # 补充 MLA 的压缩秩与 nope/rope/value 维度，统一 rope_scaling/rope_parameters 两种配置入口。
+    # legacy rope_scaling 优先；YaRN 缺失项补默认值，并把嵌套 rope_theta 提升到共享构造器读取的属性。
     def __init__(
         self,
         q_lora_rank: Optional[int] = 1536,
@@ -194,12 +208,14 @@ class K3DSparkConfig(DSparkConfig):
         # dict. An explicit legacy rope_scaling wins over rope_parameters;
         # rope_theta stays nested in the dict for serving-config round trips
         # but is also lifted to the top-level attribute _init_rope reads.
+        # 兼容新旧 Transformers 字段名时必须固定优先级，避免同一个 checkpoint 在不同库版本得到不同频率。
         params = rope_scaling if rope_scaling is not None else rope_parameters
         if params is not None:
             params = dict(params)
             rope_theta = params.get("rope_theta")
             if rope_theta is not None:
                 self.rope_theta = float(rope_theta)
+            # 共享 YaRN 构造器读取这些数值；缺省或 None 都在这里规范化，避免 later math 运算失败。
             if params.get("rope_type", params.get("type")) == "yarn":
                 yarn_defaults = {
                     "beta_fast": 32.0,
@@ -211,11 +227,13 @@ class K3DSparkConfig(DSparkConfig):
                     if params.get(key) is None:
                         params[key] = default
 
+        # 保留嵌套配置用于服务导出，rope_theta 同时已提升供训练构造器使用。
         self.rope_parameters = params
 
 
 # Deliberately not @torch.compile'd: like DFlashAttention's inline RoPE, this
 # runs eagerly and is captured by the model-level compile when enabled.
+# 对单个张量用自己的 position_ids 旋转相邻通道对；Q 与 context+draft 的 K 长度不同，不能共用索引。
 def _apply_rope_interleaved(x, cos, sin, position_ids, unsqueeze_dim=1):
     """Interleaved-pair RoPE for one tensor, with its own position ids.
 
@@ -243,6 +261,8 @@ class K3DSparkMLAAttention(nn.Module):
     _init_rope = DeepSeekMLAAttention._init_rope
     _compute_softmax_scale = DeepSeekMLAAttention._compute_softmax_scale
 
+    # 建立低秩 Q/KV 投影和共享单头 rope 键；不支持输出 gate 时明确报错。
+    # 先只缓存最多 32768 个位置，避免百万上下文配置让每层初始化就分配巨量 cos/sin。
     def __init__(self, config: K3DSparkConfig):
         super().__init__()
         self.config = config
@@ -264,6 +284,7 @@ class K3DSparkMLAAttention(nn.Module):
         # cache grows on demand and yarn inv_freq is independent of its length.
         self.max_position_embeddings = min(int(config.max_position_embeddings), 32768)
 
+        # Q 路可以先 H→Rq→heads*Dqk 低秩投影，或直接一次投影；norm 位于低秩中间特征上。
         if self.q_lora_rank is not None:
             self.q_a_proj = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
             self.q_a_layernorm = DFlashRMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
@@ -273,6 +294,7 @@ class K3DSparkMLAAttention(nn.Module):
         else:
             self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
 
+        # KV 第一步输出 [latent | 单头 rope]；只有 latent 经 norm+up 展开成每头 nope 键与 value。
         self.kv_a_proj_with_mqa = nn.Linear(
             self.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False
         )
@@ -282,12 +304,15 @@ class K3DSparkMLAAttention(nn.Module):
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
         )
+        # 输出输入宽度按 V 的每头维数计算，不按 Q/K 的 rope+nope 维数，避免 MLA 特有形状错配。
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
 
         self.rotary_emb = None
         self._init_rope()
         self.softmax_scale = self._compute_softmax_scale()
 
+    # draft 产生 Q，context+draft 一起产生压缩 KV，再把 rope 与 nope 键拼为完整每头 K。
+    # V 不旋转；使用 MLA softmax_scale，BlockMask 缺失时退化为无 mask 的双向 SDPA。
     def forward(
         self,
         draft_hidden: torch.Tensor,
@@ -309,6 +334,7 @@ class K3DSparkMLAAttention(nn.Module):
         q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # K/V from both sources through the shared MLA projections
+        # 先把两路特征拼成 [B,S+N*K,H]，共享 MLA KV 压缩投影；不会复制一份完整教师 attention 模型。
         kv_input = torch.cat([context_hidden, draft_hidden], dim=1)
         kv_combined = self.kv_a_proj_with_mqa(kv_input)
         kv_compressed, k_rope = torch.split(
@@ -321,8 +347,10 @@ class K3DSparkMLAAttention(nn.Module):
         value = value.transpose(1, 2)
 
         # Single shared rope head (MQA-style): [B, 1, ctx+draft, rope_dim]
+        # rope 键只有一个共享头，旋转后再 expand 到 H；nope 键和值由 latent 展开得到每头不同内容。
         k_rope = k_rope.unsqueeze(1)
 
+        # Q 与 K 长度/坐标集合不同，必须分别调用单张量 RoPE helper，不能使用同索引成对旋转接口。
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
         cos, sin = self.rotary_emb(q_rope, seq_len=total_len)
         cos = cos.to(draft_hidden.device)
@@ -333,6 +361,7 @@ class K3DSparkMLAAttention(nn.Module):
         query_states = torch.cat([q_nope, q_rope], dim=-1)
         key_states = torch.cat([k_nope, k_rope.expand(-1, self.num_heads, -1, -1)], dim=-1)
 
+        # 使用 DFlash 的块可见性，attention_mode=MLA 只改变投影形式，不把 MASK 块变成普通全序列因果。
         if block_mask is not None:
             attn_output = compile_friendly_flex_attention(
                 query=query_states,

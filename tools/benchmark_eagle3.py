@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# 用合成输入测 EAGLE3 完整训练步的显存和时间，包含前向、反向、BF16 优化器更新。
+# 它不运行 teacher 或远程传输，因此结果不能直接等同生产流水线吞吐；需要 CUDA 和所选 attention 后端。
+
 """Benchmark Eagle3 end-to-end training (forward + backward + optimizer step).
 
 Measures:
@@ -31,12 +34,14 @@ from torchspec.training.optimizer import BF16Optimizer
 # ---------------------------------------------------------------------------
 # Helpers (aligned with max_seq_search.py)
 # ---------------------------------------------------------------------------
+# 先同步 GPU，再收集 Python 垃圾和释放空闲缓存；仍被模型或优化器引用的显存不会被清除。
 def clear_memory():
     torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
 
 
+# 根据 H/V 构造随机 Llama draft 的维度配置，draft_vocab_size 等于完整词表，不加载预训练权重。
 def make_config(H, V, num_heads=32, num_kv_heads=8):
     config = LlamaConfig(
         hidden_size=H,
@@ -55,6 +60,7 @@ def make_config(H, V, num_heads=32, num_kv_heads=8):
     return config
 
 
+# 实例化 BF16 draft、冻结 embedding，包装多步 EAGLE3 并启用训练模式；checkpointing 与 attention 后端由参数控制。
 def make_eagle3_model(
     config,
     length=7,
@@ -75,15 +81,18 @@ def make_eagle3_model(
     return model
 
 
+# 为 draft 建 BF16Optimizer，测量包括 FP32 主权重及 AdamW 状态带来的成本。
 def make_optimizer(model):
     return BF16Optimizer(model.draft_model, lr=1e-4)
 
 
+# 清空底层 Adam 动量/方差，减少上一候选长度残留影响；不重新随机化模型或重建优化器对象。
 def reset_optimizer_state(optimizer: BF16Optimizer):
     """Reset optimizer state to free memory from momentum/variance buffers."""
     optimizer.optimizer.state.clear()
 
 
+# 生成 [B,T] token/mask、[B,T,3H] 辅助表示及 [B,T,H] 目标表示；它们是随机数，不能用 loss 判断真实收敛。
 def create_synthetic_batch(B, T, H, V, device="cuda"):
     """Create synthetic training batch matching Eagle3 expected format."""
     input_ids = torch.randint(0, V, (B, T), device=device)
@@ -100,18 +109,21 @@ def create_synthetic_batch(B, T, H, V, device="cuda"):
     }
 
 
+# 逐键删除 batch 对张量的引用；若计算图仍引用这些张量，实际分配不会立即释放。
 def cleanup_batch(batch: dict):
     """Delete batch tensors and free memory."""
     for k in list(batch.keys()):
         del batch[k]
 
 
+# 按是否裁剪词表选择 eager 目标概率或 lazy 目标表示，再运行多步 draft 并返回每步 loss。
 def run_eagle3_forward(model, batch):
     eagle3 = model.module if hasattr(model, "module") else model
     draft_model = eagle3.draft_model
     _, lm_head_weight, _ = draft_model.get_lm_head_params()
     t2d = draft_model.t2d if eagle3.vocab_pruning else None
 
+    # 裁剪词表需要把 teacher 输出投到有效词表集合；完整词表路径用 lazy 目标避免一次物化全部概率。
     if t2d is not None:
         target = compute_target_p_padded(
             target_hidden_states=batch["target_hidden_states"],
@@ -137,6 +149,7 @@ def run_eagle3_forward(model, batch):
     return plosses
 
 
+# 以 0.8 的幂衰减组合各步 loss，反向并更新优化器；不同展开步不是独立 batch。
 def run_eagle3_backward_and_update(plosses, optimizer):
     """Run backward pass and optimizer step (matches eagle3_trainer.py)."""
     ploss_weight = [0.8**i for i in range(len(plosses))]
@@ -146,6 +159,7 @@ def run_eagle3_backward_and_update(plosses, optimizer):
     return ploss
 
 
+# 每步重新构造合成数据、执行前向反向和更新，再释放 batch 引用；计时会包含随机输入生成成本。
 def run_train_step(model, optimizer, B, T, H, V):
     """Full training step: forward + backward + optimizer step."""
     batch = create_synthetic_batch(B, T, H, V)
@@ -158,12 +172,14 @@ def run_train_step(model, optimizer, B, T, H, V):
 # ---------------------------------------------------------------------------
 # 1. Memory benchmark: binary search for max sequence length
 # ---------------------------------------------------------------------------
+# 重置优化器状态后执行预热与测试步，同步后读取峰值显存；仅把明确 OOM 当不可行，其他 RuntimeError 继续抛出。
 def try_seq_len(model, optimizer, T, B, H, V, warmup_iters=2, test_iters=3) -> Tuple[bool, float]:
     reset_optimizer_state(optimizer)
     clear_memory()
     torch.cuda.reset_peak_memory_stats()
 
     try:
+        # 每候选执行多步以触发 Adam 状态分配等首次开销；只成功前向不足以证明训练能放下。
         for i in range(warmup_iters + test_iters):
             run_train_step(model, optimizer, B, T, H, V)
             if i == warmup_iters - 1:
@@ -185,6 +201,7 @@ def try_seq_len(model, optimizer, T, B, H, V, warmup_iters=2, test_iters=3) -> T
         raise
 
 
+# 按 step 网格二分可容纳的 T，成功增大下界、失败缩小上界；依赖可行性近似单调这一假设。
 def binary_search_max_seq(
     model, optimizer, B, H, V, lo=256, hi=131072, step=256, verbose=True
 ) -> Tuple[int, float]:
@@ -196,6 +213,7 @@ def binary_search_max_seq(
     if verbose:
         print(f"  {'T':>8s}  {'status':>6s}  {'peak_mem':>10s}")
 
+    # 例如 step=256，候选始终落在该网格上；报告的是测试网格中的最大成功点，而不是逐 token 精确极限。
     while lo <= hi:
         mid = (lo + hi) // 2
         mid = mid // step * step
@@ -214,9 +232,11 @@ def binary_search_max_seq(
         else:
             hi = mid - step
 
+    # best 初始为下界，若所有测试都失败仍可能返回该值且 best_mem=0；应结合成功日志解释结果。
     return best, best_mem
 
 
+# 创建一组模型/优化器做容量搜索，结束后删除并清理缓存，返回最大候选及对应峰值。
 def benchmark_memory(
     B,
     H,
@@ -256,6 +276,7 @@ def benchmark_memory(
 # ---------------------------------------------------------------------------
 # 2. Speed benchmark: full training step time
 # ---------------------------------------------------------------------------
+# 预热后重置峰值，用前后 CUDA 同步包住每个完整训练步的墙钟计时，返回平均毫秒和峰值 GiB。
 def time_eagle3(model, optimizer, B, T, H, V, warmup=3, repeats=10) -> Tuple[float, float]:
     reset_optimizer_state(optimizer)
     clear_memory()
@@ -265,10 +286,13 @@ def time_eagle3(model, optimizer, B, T, H, V, warmup=3, repeats=10) -> Tuple[flo
         torch.cuda.synchronize()
 
     torch.cuda.synchronize()
+    # 预热包含编译和优化器状态首次分配，正式计时把它们排除；峰值统计仍含当前常驻权重与状态。
     torch.cuda.reset_peak_memory_stats()
     times = []
     for _ in range(repeats):
         torch.cuda.synchronize()
+        # CUDA 异步提交很快，若不在前后 synchronize，CPU 墙钟只会量到发射开销。
+        # 这里计时还包含随机 batch 构造与 Python 调度，不能与纯 kernel event 时间直接比较。
         t0 = time.perf_counter()
         run_train_step(model, optimizer, B, T, H, V)
         torch.cuda.synchronize()
@@ -279,6 +303,7 @@ def time_eagle3(model, optimizer, B, T, H, V, warmup=3, repeats=10) -> Tuple[flo
     return sum(times) / len(times), peak_mem
 
 
+# 把 OOM 及所有 RuntimeError 都转换成无穷耗时；因此表中 OOM 标记也可能代表其他运行错误。
 def _try_time(model, optimizer, B, T, H, V, **kwargs):
     try:
         return time_eagle3(model, optimizer, B, T, H, V, **kwargs)
@@ -288,6 +313,7 @@ def _try_time(model, optimizer, B, T, H, V, **kwargs):
         return float("inf"), 0.0
 
 
+# 每个 T 独立创建模型和优化器，减少跨长度状态干扰；收集步耗时和显存并格式化输出。
 def benchmark_speed(
     B,
     H,
@@ -322,6 +348,7 @@ def benchmark_speed(
 
         results.append({"T": T, "ms": ms, "mem": mem})
 
+        # 把无穷时间显示为 OOM，零显存显示 N/A；只是报告约定，并没有进一步判别异常原因。
         def _fmt(ms, mem):
             ms_s = f"{ms:.1f}" if ms != float("inf") else "OOM"
             mem_s = f"{mem:.1f}" if mem > 0 else "N/A"
@@ -336,6 +363,7 @@ def benchmark_speed(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# 读取模型/后端维度，先搜索容量，再测能放下的候选长度并打印硬件与配置，便于解释结果边界。
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Eagle3 end-to-end training")
     parser.add_argument("--hidden-size", type=int, default=4096)
@@ -376,6 +404,7 @@ def main():
     print()
 
     # 1. Memory benchmark
+    # 先建立容量上界，再限制速度测试候选，减少明显无法容纳的运行。
     max_seq, peak_mem = benchmark_memory(
         B,
         H,
@@ -388,6 +417,7 @@ def main():
     )
 
     # 2. Speed benchmark
+    # 速度比较应保留相同 H/V、batch、展开长度、checkpointing 和后端；只比较一列毫秒会混入不同工作量。
     speed_lens = [s for s in [512, 1024, 2048, 4096, 8192, 16384, 32768] if s <= max_seq]
     if not speed_lens:
         speed_lens = [256, 512]

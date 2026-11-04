@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：公开导入入口，区分训练包装 Model、草稿 DraftModel 和结构 Config。
+# 导入这里会连带加载模型依赖；阅读实现请进入 models/，入门路线见 docs/reading-guide/zh/README.md。
+
 """TorchSpec - Torch native spec decode training framework."""
 
 from torchspec.models import Eagle3Model

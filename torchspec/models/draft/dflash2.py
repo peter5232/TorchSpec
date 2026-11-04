@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# DFlash2 在双源 KV 骨干中加入块内动态分组卷积，并用低秩前驱/后继码本重排候选。
+# 配置解析与导出同时处理训练字段和服务端嵌套 dflash_config，保持权重形状及标定语义一致。
 """DFlash2 draft model adapted from z-lab/dflash at revision 07ebd93.
 
 Source: https://github.com/z-lab/dflash/tree/07ebd93db9f472af339b644bb70221ad8428328a
@@ -58,6 +60,8 @@ _NESTED_CONFIG_FIELDS = (
 )
 
 
+# 深拷贝原始配置，把服务字段归入 dflash_config，重命名教师层数并写 model_type=qwen3。
+# 非 vLLM 导出要求 input_embedding_scale=1，避免服务端不能复现训练缩放。
 def dflash2_config_for_serving(raw_config: dict, *, export_for_vllm: bool = False) -> dict:
     config = json.loads(json.dumps(raw_config))
     dflash_config = dict(config.get("dflash_config") or {})
@@ -76,6 +80,7 @@ def dflash2_config_for_serving(raw_config: dict, *, export_for_vllm: bool = Fals
     return config
 
 
+# 省略共享 embedding，重命名 context/final norm 前缀；其余卷积与 selector 权重原样保留。
 def dflash2_state_dict_for_serving(
     state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
@@ -95,6 +100,8 @@ def dflash2_state_dict_for_serving(
 class DFlash2Config(DFlashConfig):
     model_type = "qwen3_dflash2"
 
+    # 归一化嵌套/平铺字段、教师捕获层列表、GQA/MLA 与 RoPE 配置，并逐项拒绝未支持的架构组合。
+    # 校验卷积核不超过块长、group_size 整除 H、top-k/词表范围和逐层滑窗；最后保留可导出的嵌套副本。
     def __init__(
         self,
         block_size: int = 16,
@@ -124,6 +131,7 @@ class DFlash2Config(DFlashConfig):
                 f"DFlash2 model_type must be 'qwen3' or 'qwen3_dflash2', got {model_type!r}"
             )
 
+        # 阶段一：服务端嵌套 dflash_config 优先于平铺参数，统一转成训练需要的 Python 标量。
         block_size = int(nested.get("block_size", block_size))
         conv_kernel_size = int(nested.get("conv_kernel_size", conv_kernel_size))
         conv_group_size = int(nested.get("conv_group_size", conv_group_size))
@@ -138,6 +146,7 @@ class DFlash2Config(DFlashConfig):
             if final_logit_softcapping == 0.0:
                 final_logit_softcapping = None
 
+        # 阶段二：区分教师总深度与捕获路数。服务配置 num_target_layers 可能指教师深度，训练父类字段则表示路数。
         nested_target_layer_ids = nested.get("target_layer_ids")
         target_layer_ids = (
             nested_target_layer_ids
@@ -168,6 +177,7 @@ class DFlash2Config(DFlashConfig):
             kwargs["num_target_layers"] = len(target_layer_ids)
             kwargs["target_layer_ids"] = target_layer_ids
 
+        # 逐项验证捕获层号在教师 block 索引范围，错误位置不能留给运行时 hook 或特征拼接才暴露。
         if not target_layer_ids:
             raise ValueError("target_layer_ids must contain at least one layer")
         target_depth = int(kwargs.get("target_num_hidden_layers", 36))
@@ -179,6 +189,7 @@ class DFlash2Config(DFlashConfig):
                 f"target_layer_ids must be in [0, {target_depth}), got {invalid_layer_ids}"
             )
 
+        # 当前 DFlash2 要求教师 hidden 与 draft residual 宽度一致，不能仅靠 context_proj 猜测兼容任意宽度。
         hidden_size = int(kwargs.get("hidden_size", 4096))
         target_hidden_size = kwargs.get("target_hidden_size")
         if target_hidden_size is None:
@@ -198,6 +209,7 @@ class DFlash2Config(DFlashConfig):
         kwargs.setdefault("rope_theta", rope_parameters_for_validation.get("rope_theta", 10000.0))
         kwargs.pop("model_type", None)
 
+        # 阶段三：验证训练实现能精确复现 checkpoint 的算子选择；不支持的 bias/dropout/fc_norm 直接拒绝。
         hidden_act = kwargs.get("hidden_act", "silu")
         if hidden_act != "silu":
             raise ValueError(f"DFlash2 training requires hidden_act='silu', got {hidden_act!r}")
@@ -211,6 +223,7 @@ class DFlash2Config(DFlashConfig):
             raise ValueError(
                 f"DFlash2 attention_mode must be 'gqa' or 'mla', got {attention_mode!r}"
             )
+        # GQA 当前只接受 default RoPE 参数；MLA 可使用共享 DeepSeek RoPE/YaRN 路径，限制不同。
         if attention_mode == "gqa":
             if rope_scaling is not None:
                 raise ValueError("GQA DFlash2 training does not support rope_scaling")
@@ -224,6 +237,7 @@ class DFlash2Config(DFlashConfig):
             ):
                 raise ValueError("GQA DFlash2 training supports only default rope_parameters")
 
+        # 阶段四：展开每层 attention 类型表；后续 wrapper 必须用这张表构造对应层 mask。
         num_hidden_layers = int(kwargs.get("num_hidden_layers", 5))
         use_sliding_window = bool(kwargs.get("use_sliding_window", False))
         sliding_window = kwargs.get("sliding_window")
@@ -263,6 +277,7 @@ class DFlash2Config(DFlashConfig):
         kwargs["layer_types"] = layer_types
         kwargs["sliding_window"] = sliding_window
 
+        # 阶段五：约束卷积、候选数、词表和缩放常数，提前把非法 tensor shape 与 NaN/无穷配置挡住。
         if block_size < 2:
             raise ValueError(f"block_size must be at least 2, got {block_size}")
         if not 1 <= conv_kernel_size <= block_size:
@@ -296,6 +311,7 @@ class DFlash2Config(DFlashConfig):
                 f"final_logit_softcapping must be positive, got {final_logit_softcapping}"
             )
 
+        # 父类初始化共享 DFlash 字段，随后填入卷积/selector/MLA 扩展属性，避免未知 kwargs 被静默忽略。
         super().__init__(**kwargs)
         self.attention_mode = attention_mode
         self.q_lora_rank = q_lora_rank
@@ -331,6 +347,7 @@ class DFlash2Config(DFlashConfig):
         self.output_multiplier = output_multiplier
         self.final_logit_softcapping = final_logit_softcapping
 
+        # 保留导出需要的规范字段；非默认缩放才写入嵌套配置，训练和服务读取应得到同一数值。
         nested.update(
             {
                 "attention_mode": self.attention_mode,
@@ -353,6 +370,8 @@ class DFlash2Config(DFlashConfig):
 
 
 class DFlashGroupedConv(nn.Module):
+    # 每组含 group_size 个通道，两侧分别有 [kernel,H] 基础核；动态投影每 token 生成组级偏移。
+    # 基础 offset=0 为 1、其他为 0，动态权重全零，使初始卷积为恒等映射。
     def __init__(
         self,
         hidden_size: int,
@@ -378,6 +397,8 @@ class DFlashGroupedConv(nn.Module):
         )
         nn.init.zeros_(self.kernel_projection.weight)
 
+    # reshape 成 [B*N,K,G,C]，各 offset 仅向本块左侧取值，左缘补零，不跨块泄漏。
+    # 每组动态系数广播到组内通道，再与通道级基础核相加；如 K=3、核长 2，第二槽混合 x1 与 x0。
     def _convolve(
         self,
         hidden_states: torch.Tensor,
@@ -391,6 +412,7 @@ class DFlashGroupedConv(nn.Module):
             )
 
         blocks = hidden_states.reshape(-1, self.block_size, self.num_groups, self.group_size)
+        # group_size 是每组通道数，num_groups=H/group_size；动态系数在组内共享，基础核仍逐通道独立。
         dynamic = dynamic_kernel.reshape(-1, self.block_size, self.kernel_size, self.num_groups)
         base = self.base_kernel[side].reshape(
             1, 1, self.kernel_size, self.num_groups, self.group_size
@@ -399,10 +421,12 @@ class DFlashGroupedConv(nn.Module):
 
         output = torch.zeros_like(blocks)
         for offset in range(self.kernel_size):
+            # 最外层已合并 B 与块号，padding 发生在各块自己的槽维，最后一槽不会卷入下一个块。
             values = blocks if offset == 0 else F.pad(blocks[:, :-offset], (0, 0, 0, 0, offset, 0))
             output = output + coefficients[:, :, offset] * values
         return output.reshape(batch, length, hidden_size)
 
+    # 一次投影生成前/后两套动态核，立即应用前核并返回后核；后核由子层输入决定。
     def prepare(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         dynamic = self.kernel_projection(hidden_states).reshape(
             *hidden_states.shape[:-1],
@@ -412,6 +436,7 @@ class DFlashGroupedConv(nn.Module):
         )
         return self._convolve(hidden_states, dynamic[..., 0, :, :], 0), dynamic[..., 1, :, :]
 
+    # 对子层输出使用 prepare 留下的后核，保持前后卷积条件来自同一份子层输入。
     def finish(
         self,
         hidden_states: torch.Tensor,
@@ -421,6 +446,7 @@ class DFlashGroupedConv(nn.Module):
 
 
 class CandidateSelector(nn.Module):
+    # 分配前驱、后继 [V,R] 码本与 H→R 投影；只重排 top_k 候选，避免构造 V×V 转移矩阵。
     def __init__(self, hidden_size: int, vocab_size: int, rank: int, top_k: int):
         super().__init__()
         if not 2 <= top_k <= vocab_size:
@@ -432,6 +458,8 @@ class CandidateSelector(nn.Module):
         nn.init.normal_(self.predecessor_codebook, std=0.02)
         nn.init.normal_(self.successor_codebook, std=0.02)
 
+    # 先取 unary top-k；训练时若正确后继缺失，用它替换候选中最低 logit 的位置。
+    # 分数为 unary+(前驱码*hidden投影)·后继码，返回分数及候选 token id；候选维索引不是词表 id。
     def score_candidates(
         self,
         hidden_states: torch.Tensor,
@@ -444,6 +472,7 @@ class CandidateSelector(nn.Module):
         if training_successor_ids is not None:
             matches = candidate_ids == training_successor_ids.unsqueeze(-1)
             missing = ~matches.any(dim=-1)
+            # topk(sorted=False) 的最后一项不一定最小；必须显式 argmin 决定替换位置。
             replace_at = unary_logits.argmin(dim=-1, keepdim=True)
             current_ids = candidate_ids.gather(-1, replace_at)
             current_logits = unary_logits.gather(-1, replace_at)
@@ -460,11 +489,13 @@ class CandidateSelector(nn.Module):
         hidden = self.hidden_projection(hidden_states)
         predecessor = self.predecessor_codebook[predecessor_ids] * hidden
         successor = self.successor_codebook[candidate_ids]
+        # 只对 K 个候选做秩 R 内积，成本随 K*R 而非 V² 增长；unary logits 仍参与梯度。
         scores = unary_logits + torch.einsum("...r,...kr->...k", predecessor, successor)
         return scores, candidate_ids
 
 
 class DFlash2DecoderLayer(DFlashDecoderLayer):
+    # 按 attention_mode 可替换为 MLA；为 attention 和 MLP 各建立独立的前后分组卷积。
     def __init__(self, config: DFlash2Config):
         if config.attention_mode == "mla":
             from torchspec.models.draft.dspark import K3DSparkMLAAttention
@@ -480,6 +511,8 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         self.attention_conv = DFlashGroupedConv(**conv_args)
         self.mlp_conv = DFlashGroupedConv(**conv_args)
 
+    # 每个残差子层执行 norm→前卷积→attention/MLP→后卷积→残差。
+    # 两段动态核由各自 norm 后输入生成，卷积不改变 tensor 的 [B,N*K,H] 形状。
     def forward(
         self,
         draft_hidden: torch.Tensor,
@@ -513,6 +546,7 @@ class DFlash2DraftModel(DFlashDraftModel):
     config_class = DFlash2Config
     decoder_layer_class = DFlash2DecoderLayer
 
+    # 复用 DFlash 的层堆栈及上下文融合，额外挂 CandidateSelector 供训练包装器计算附加损失。
     def __init__(self, config: DFlash2Config):
         super().__init__(config)
         self.candidate_selector = CandidateSelector(
@@ -522,9 +556,11 @@ class DFlash2DraftModel(DFlashDraftModel):
             top_k=config.selector_top_k,
         )
 
+    # 将当前配置转换成服务端嵌套布局，并执行对应的输入缩放兼容性检查。
     def config_for_serving(self) -> dict:
         return dflash2_config_for_serving(self.config.to_dict())
 
+    # 可转换显式提供的 state_dict，否则读取当前模型；这允许导出已聚合的分布式权重。
     def state_dict_for_serving(
         self,
         state_dict: dict[str, torch.Tensor] | None = None,
@@ -533,6 +569,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             state_dict = self.state_dict()
         return dflash2_state_dict_for_serving(state_dict)
 
+    # 确保 embedding 只查一次，并在进入继承的 DFlash 骨干前乘 input_embedding_scale。
     def forward(
         self,
         draft_input_ids: torch.Tensor | None,

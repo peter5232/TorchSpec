@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 中文导读：导入并注册 kimi-k3 renderer；注册发生在包导入时，使配置名称能找到具体实现。
+
 from torchspec.data.renderers.base import DEFAULT_CACHE_VERSION, ConversationRenderer
 from torchspec.data.renderers.kimi_k3 import K3Renderer
 from torchspec.data.renderers.registry import RENDERER_REGISTRY, RendererRegistry

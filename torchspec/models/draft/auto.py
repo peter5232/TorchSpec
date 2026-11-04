@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 配置 architecture 名称到具体 draft 类的路由；服务配置、训练构造和权重加载共享这个入口。
+# EAGLE 名称不意味着只支持 Llama，映射同时包括 MLA 和块预测家族。
 import json
 import os
 from typing import Union
@@ -42,6 +44,8 @@ from torchspec.utils.logging import logger
 class EagleLlamaConfig(LlamaConfig):
     """LlamaConfig whose drafts may size attention by an explicit head_dim."""
 
+    # 跳过 Llama 专有的 hidden_size 整除 head 数校验，保留通用配置校验。
+    # 显式 head_dim 可使注意力宽度独立于残差宽度，例如 24*256 不必等于 hidden_size。
     def validate_architecture(self):
         # Skip only LlamaConfig's hidden_size % num_attention_heads check, which explicit
         # head_dim drafts break (Qwen3.8: 24 heads x 256 over hidden_size 5120).
@@ -59,6 +63,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         K3DSparkConfig: K3DSparkModel,
     }
 
+    # 按配置的精确类型选择模型类，再按需转换浮点 dtype；不会自动加载预训练权重。
     @classmethod
     def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
         _model_cls = cls._model_mapping[type(config)]
@@ -68,6 +73,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
             model = model.to(dtype=torch_dtype)
         return model
 
+    # 临时过滤 embedding 未初始化提示，让基类完成权重加载；finally 必须恢复全局 logger 方法。
     @classmethod
     def from_pretrained(
         cls,
@@ -77,6 +83,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     ):
         original_warn = modeling_utils.logger.warning
 
+        # 只吞掉涉及 embed_tokens.weight 的初始化提示，其余 warning 原样转发。
         def filtered_warning(msg):
             if "embed_tokens.weight" in str(msg) and "initialized" in str(msg):
                 return
@@ -104,6 +111,8 @@ class AutoDraftModelConfig:
         "K3DSparkModel": K3DSparkConfig,
     }
 
+    # 复制字典后强制显式出现的 tie_word_embeddings=False，验证唯一 architecture 并选择配置类。
+    # 未提供 draft_vocab_size 时补成 target 词表尺寸，避免把缺省误认为裁剪。
     @classmethod
     def from_dict(cls, config: dict):
         config = dict(config)
@@ -130,6 +139,7 @@ class AutoDraftModelConfig:
 
         return cls._config_mapping[architecture].from_dict(config)
 
+    # 从 JSON 读取配置，再走与字典入口完全相同的架构与词表校验。
     @classmethod
     def from_file(cls, config_path: str):
         with open(config_path, "r") as f:
