@@ -158,6 +158,8 @@ class AsyncTrainingController:
         self._pool_bytes = 0
         self._sample_bytes: dict[str, int] = {}
 
+        # 此处没有为 Ray 队列指定 maxsize；生产节奏主要由外层 loop 的 queued_batches/prefetch 控制。
+        # 输出池阈值与队列条数不是同一约束，样本离开 pool 后仍可能在队列里等待很久。
         self.train_queues = [Queue() for _ in range(self.queue_count)]
 
         # Eval: separate pool and queues so eval data never mixes with training
@@ -169,6 +171,8 @@ class AsyncTrainingController:
         self.eval_queues = [Queue() for _ in range(self.queue_count)]
 
         self.batch_id = 0
+        # DP=2、每 DP 两条时，一次 dispatch 消耗 4 条独立样本；SP=2 虽有 4 个队列，
+        # 不再把 dispatch 乘 2。若梯度累积为 3，外层需 3 次 dispatch 才凑齐一次 optimizer step。
         self.dispatch_batch_size = args.per_dp_rank_batch_size * dp_size
         self.eval_dispatch_batch_size = dp_size
         self._data_id_counter = 0
@@ -338,6 +342,8 @@ class AsyncTrainingController:
         """Re-add the stored dataset to the prompt buffer (epoch reload)."""
         assert self._stored_dataset is not None, "No stored dataset to reload"
         self._dataset_epoch += 1
+        # 追加新 epoch，不清空此前的 prompt、结果池或训练队列；异步晚到结果可能跨 epoch 边界。
+        # 因而 _dataset_epoch 描述投递顺序，不能充当每个已完成回包的精确训练 epoch 标签。
         return self.add_dataset(self._prepare_dataset())
 
     # 将验证集截到 DP 数量的整数倍，确保每次评估分发时各数据副本都有样本。
@@ -408,6 +414,7 @@ class AsyncTrainingController:
         with self._prompt_lock:
             entries = []
             for _ in range(min(num_prompts, len(self.prompt_buffer))):
+                # pop 是所有权交接而非借阅；后续引擎失败没有自动把这个 entry 放回控制器。
                 entries.append(self.prompt_buffer.popleft())
             return entries
 
@@ -429,6 +436,8 @@ class AsyncTrainingController:
         """
         eval_results = []
         train_results = []
+        # 分流依据是提交 eval 时登记的 ID 集合，而非 key 名称或张量 shape；
+        # 若训练与评估复用同一 data_id（离线回放保留原 ID），调用方须保证命名空间不歧义。
         for result in results:
             if result.data_id in self._eval_data_ids:
                 eval_results.append(result)
@@ -447,6 +456,8 @@ class AsyncTrainingController:
                         result.tensor_shapes or {},
                         result.tensor_dtypes or {},
                     )
+                    # 估算使用逻辑 shape/dtype，不逐个枚举 PP 层键、重复 ids、USP 重叠片段或复制副本。
+                    # 此表也不去重：协议要求每次发布 key 唯一，重复 key 会覆盖条目但仍再次增加总账。
                     self._sample_bytes[result.mooncake_key] = sample_bytes
                     self._pool_bytes += sample_bytes
                 self.sample_pool.extend(train_results)
@@ -513,6 +524,7 @@ class AsyncTrainingController:
         Raises:
             RuntimeError: If the inference manager has reported a fatal error.
         """
+        # 先检查致命错误，再查看是否凑齐；即便池中还有完整旧批次，也不会继续分发掩盖引擎死亡。
         if self._inference_error is not None:
             raise RuntimeError(f"Inference engine failed: {self._inference_error}")
 
@@ -534,6 +546,8 @@ class AsyncTrainingController:
                     f"try_dispatch_batch: pool_size={pool_size} >= dispatch_batch_size={self.dispatch_batch_size}, dispatching batch {self.batch_id}"
                 )
 
+            # 从 pool 按到达顺序取一整批，之后才在批内做 DP 负载平衡；
+            # 因此全局训练顺序受异步完成顺序影响，并不等于最初数据集的排列顺序。
             batch_results = []
             for _ in range(self.dispatch_batch_size):
                 result = self.sample_pool.popleft()
@@ -543,6 +557,8 @@ class AsyncTrainingController:
                 self._pool_bytes -= sample_bytes
                 batch_results.append(result)
 
+        # 出池和入各队列不是事务：这里失败时可能只有部分 rank 收到样本，池字节已扣减。
+        # 锁外发送缩短池临界区，但没有自动回滚；True 仅在所有 put 正常返回后才成立。
         self._dispatch_to_queues(batch_results, self.train_queues)
 
         self._training_monitor.record(self.dispatch_batch_size)
@@ -582,6 +598,8 @@ class AsyncTrainingController:
 
         # 贪心平衡同时满足“每 rank 条数相等”和“累计 token 尽量接近”。
         # 前者保证每个消费者取到预期数量，后者减少同步训练中等待最慢 rank 的时间。
+        # 贪心负载用 token 数代理算量，不估计 attention 的二次项、padding、图像展开等真实成本。
+        # 同负载时 min 先选 rank 小者；同长度样本保留 sorted 的稳定输入顺序。
         capacity = len(results) // self.dp_size
         loads = [0] * self.dp_size
         for result in sorted(results, key=self._seq_len, reverse=True):
@@ -619,6 +637,8 @@ class AsyncTrainingController:
                 if self.sp_size > 1 and len(queues) == self.queue_count:
                     # 把同一个 TrainSample 放到同一 DP 组各独立队列，相当于广播元数据。
                     # 若只让多个 rank 消费同一条共享队列，一次 get 会取走条目，其他 rank 并不会自动得到副本。
+                    # DP=2、SP=2：DP0 的 A/B 放进队列 0 和 1；DP1 的 C/D 放进 2 和 3。
+                    # 四条逻辑样本产生八次元数据 put，但同组 SP rank 协作处理相同样本，不是八条独立数据。
                     start = dp_rank * self.sp_size
                     for rank in range(start, start + self.sp_size):
                         queues[rank].put(sample)
@@ -688,6 +708,7 @@ class AsyncTrainingController:
 
         eval_entries = self._build_eval_entries(chunk)
 
+        # 优先级只作用于控制器尚未被取走的输入：manager 本地预取和引擎在途的训练批次不会被抢占。
         with self._prompt_lock:
             self.prompt_buffer.extendleft(reversed(eval_entries))
         logger.info(
@@ -708,6 +729,8 @@ class AsyncTrainingController:
     # 凑齐一个评估 dispatch 后出池，按同一分区规则发送并累计已分发数；不足则返回 False。
     def try_dispatch_eval_batch(self) -> bool:
         """Dispatch one eval batch from the pool if enough samples are available."""
+        # eval 一次每 DP 一条，再广播给该 DP 的 SP 队列；不同于训练的 per_dp_rank_batch_size。
+        # 本方法没有训练分发中的 _inference_error 检查，调用方 eval.generate_eval_cache 另有空闲超时。
         bs = self.eval_dispatch_batch_size
         with self._eval_pool_lock:
             if len(self.eval_pool) < bs:
@@ -748,6 +771,7 @@ class AsyncTrainingController:
                 logger.info(
                     f"Eval: dropping {pool_remaining} leftover samples that didn't fill a batch"
                 )
+                # 这里只丢元数据，不调用 Mooncake remove；若真有尾部对象，其远端回收不能由此推断。
                 self.eval_pool.clear()
 
         self._eval_data_ids.clear()
@@ -797,6 +821,8 @@ class AsyncTrainingController:
     # 给每个训练队列放入 None 结束哨兵，通知阻塞读取的消费者停止；不强行杀掉 actor。
     def shutdown(self) -> None:
         """Signal training workers to stop by sending None to queues."""
+        # FIFO 中已有样本仍排在 None 前面，消费者取到哨兵才退出；这不是清空队列或取消远程 GET。
+        # 此方法只遍历训练队列，不向 eval_queues 发送停止信号。
         for q in self.train_queues:
             q.put(None)
         logger.info("Controller shutdown: sent stop signals to training queues")

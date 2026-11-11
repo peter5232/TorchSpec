@@ -71,6 +71,8 @@ class OfflineDataset:
         ):
             raise ValueError("Offline dataset uses a different hidden-state representation")
 
+        # 元数据只记录 schema 与 norm 约定，没有 teacher 权重/层号/tokenizer 的指纹。
+        # 能打开目录不等于能证明它与当前训练配置完全兼容；这些语义仍由生成与训练配置保持一致。
         self._rows: dict[str, list[dict[str, str]]] = {"train": [], "eval": []}
         self._by_id: dict[str, dict[str, str]] = {}
         manifest = self.root / "manifest.jsonl"
@@ -79,6 +81,8 @@ class OfflineDataset:
                 for lineno, line in enumerate(stream, 1):
                     if not line.strip():
                         continue
+                    # manifest 是恢复时的记录来源，不扫描 samples/ 猜测完成进度。
+                    # 末尾损坏的 JSON 行会直接报错；这里没有忽略残行、修复清单或找回孤立文件的逻辑。
                     row = json.loads(line)
                     split = row.get("split")
                     data_id = str(row.get("data_id"))
@@ -95,6 +99,8 @@ class OfflineDataset:
                         "file": row["file"],
                         "seq_len": row["seq_len"],
                     }
+                    # 一条清单同时进入 split 顺序表和全局 ID 表；ID 不能只在 split 内唯一。
+                    # 如 train 的 "42" 已存在，eval 不能也叫 "42"，否则回放按 ID 查询无法区分。
                     self._rows[split].append(item)
                     self._by_id[data_id] = item
 
@@ -115,6 +121,8 @@ class OfflineDataset:
     def load(self, row_or_id: dict[str, str] | str) -> dict[str, Any]:
         row = self._by_id[str(row_or_id)] if isinstance(row_or_id, str) else row_or_id
         path = self.root / row["file"]
+        # 清单只提供路径/长度，dtype 与真实 shape 来自 .pt 张量本身。
+        # 如 input_ids=[1,4]、hidden_states=[1,4,6]，这里只恢复这些原尺寸，不做 padding/左移。
         record = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
         if not isinstance(record, dict):
             raise ValueError(f"Offline sample must contain a dict: {path}")
@@ -124,6 +132,8 @@ class OfflineDataset:
             isinstance(record.get(name), torch.Tensor) for name in ("input_ids", "hidden_states")
         ):
             raise ValueError(f"Offline sample has missing tensors: {path}")
+        # 这里只检查 ID 和两项必需张量的类型，不校验 seq_len、各张量时间维一致或 hidden 宽度。
+        # 可选 target/last_hidden_states 缺失是合法格式，但是否足够训练某种 loss 由下游决定。
         return record
 
     # 已存在同 split 的 ID 返回 False；新样本 detach 后存 CPU 连续张量，再提交清单记录。
@@ -144,8 +154,13 @@ class OfflineDataset:
         if data_id in self._by_id:
             if self._by_id[data_id]["split"] != split:
                 raise ValueError(f"data_id {data_id!r} already exists in another split")
+            # 同 split 重复 ID 在读取新 tensors 之前就返回：不会比较内容，也不会更新旧 mask/metadata。
+            # 所谓续写去重是保留第一次记录，不是用相同 ID 刷新教师特征。
             return False
 
+        # 只保留四个传输字段；to_tensor_dict 可能附带 input_ids_cpu/loss_mask，
+        # 它们不写入文件，监督范围单独保存 packed_loss_mask。detach 不会改变数值或 dtype；
+        # 已是 CPU 连续张量时也未必复制，所以调用者须等本次同步 torch.save 完成后才复用缓冲。
         saved = {
             name: value.detach().cpu().contiguous()
             for name, value in tensors.items()
@@ -174,6 +189,8 @@ class OfflineDataset:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
+        # 例：单样本 input_ids.shape=(1,4) 时 seq_len=4；用的是 numel 而非 shape[-1]。
+        # 因而本格式按一条记录一个样本使用，不应把 B>1 的整个 batch 当成一条记录追加。
         row = {
             "split": split,
             "data_id": data_id,
@@ -184,6 +201,9 @@ class OfflineDataset:
             stream.write(json.dumps(row) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+        # 只有清单 flush/fsync 成功后才更新本进程索引。若文件替换成功而清单提交失败，
+        # 重启会看不到该 ID，后续同 ID 追加可覆盖孤立 .pt；此处不会自动重试或扫描恢复。
+        # 样本文件和目录没有显式 fsync；os.replace 的原子命名不等于断电后的跨文件持久事务。
         self._rows[split].append(row)
         self._by_id[data_id] = row
         return True

@@ -77,6 +77,8 @@ def materialize(args, output_dir: str, *, overwrite: bool = False) -> dict[str, 
     # including a final partial inference batch.
     # 物化要保存每一条原始样本，不希望像优化器训练那样丢掉不足 global batch 的尾部。
     # 控制器用 DP=1 且每次一条，因此无论引擎批大小如何，最后剩余样本也可逐条消费。
+    # 例如 5 条输入、引擎 batch=2，产出可以是 2+2+1，但消费仍按五次单样本提交。
+    # 这里改变的是控制器 dispatch 粒度，不把 teacher 引擎的 inference_batch_size 改成 1。
     args.per_dp_rank_batch_size = 1
     # 先建立磁盘格式元信息，尤其记录最后隐状态是否 pre-norm；后续回放必须复用这一语义。
     # overwrite 参数会沿构造路径删除已有目录，阅读/使用这个入口时要区分普通续写和明确覆盖。
@@ -93,11 +95,15 @@ def materialize(args, output_dir: str, *, overwrite: bool = False) -> dict[str, 
         runtime_env={"env_vars": get_torchspec_env_vars()},
         scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=driver_node_id, soft=False),
     ).remote(args, 1)
+    # 这里仍从配置加载全部源数据，没有用已有 manifest 的 IDs 从源数据中剔除已完成项。
+    # 重启续写可能重新跑 teacher；节省的是重复落盘，不能理解成从最后一次 GPU 进度继续计算。
     train_size, eval_size = ray.get(
         [controller.load_dataset.remote(args), controller.load_eval_dataset.remote(args)]
     )
     # 裁剪词表的映射是数据语义的一部分，一并保存使回放训练不用重新根据其他语料选词。
     # 若重新选词，同一 lm_head 列可能对应不同 token，即便所有张量维度看起来正确。
+    # 映射按本次源数据计算并替换，未与旧文件做内容一致性比较；同目录续写应保持源数据/模型语义。
+    # dataset.json 的 norm 检查无法发现词表映射或教师辅助层配置变化。
     _save_vocab_mapping(controller, output_dir, draft_config)
 
     # 这里只分配推理 GPU；保存 actor 使用 CPU 并从 Mooncake 下载，不创建草稿训练进程。
@@ -152,6 +158,8 @@ def materialize(args, output_dir: str, *, overwrite: bool = False) -> dict[str, 
                 ("train", controller.try_dispatch_batch),
             ):
                 if processed[split] < expected[split] and ray.get(method.remote()):
+                    # dispatch 成功只说明 TrainSample 已放入队列；等 saver RPC 正常返回才算消费完成。
+                    # append 因重复 ID 返回 0 仍算一次 processed；RPC 抛错则本轮不会加一。
                     ray.get(saver.save_from_queue.remote(split))
                     processed[split] += 1
                     made_progress = True
@@ -165,6 +173,8 @@ def materialize(args, output_dir: str, *, overwrite: bool = False) -> dict[str, 
             )
             # 只有管理器输入/任务、控制器输入/训练结果、评估结果五处都空，才判断生产流已经耗尽。
             # 若此时 processed 未达到 expected，就说明有样本未成功产出；应报错而不是返回一个悄悄变小的数据集。
+            # 这是多个 actor 的状态快照组合，不是跨 actor 的原子快照或对每个 ID 的完成确认。
+            # 它用于发现流水线已无工作却少样本的情况，不提供失败样本的重试/补齐机制。
             drained = (
                 manager_status["prompt_buffer_size"] == 0
                 and manager_status["pending_tasks"] == 0

@@ -58,6 +58,8 @@ class OfflineSavingActor:
                     f"sample {sample.data_id} carries a per-layer PP manifest. "
                     "Generate offline data with vllm_pp_size=1."
                 )
+            # TrainSample 是小描述符，不含 hidden 的大块字节；shapes/dtypes 告诉 get 如何分配接收张量。
+            # 例如 "torch.bfloat16" 必须还原为 torch.bfloat16，不能当字符串参与字节尺寸计算。
             dtypes = {
                 key: getattr(torch, value.replace("torch.", ""))
                 if isinstance(value, str)
@@ -70,6 +72,8 @@ class OfflineSavingActor:
                 dtypes=dtypes,
                 device=torch.device("cpu"),
             )
+            # get 已正常返回才进入这个 finally；若 get 自己失败，下面的 remove 不会执行。
+            # CPU 输出可能来自可复用接收缓冲，因此本轮 append 同步写完后才进行下一次 get。
             try:
                 written += self.dataset.append(
                     split,
@@ -78,7 +82,10 @@ class OfflineSavingActor:
                     packed_loss_mask=sample.packed_loss_mask,
                     metadata=sample.metadata,
                 )
+            # written 统计新增磁盘记录，不是拉取次数。已有 ID 返回 False 时仍清理本次发布的临时对象。
             finally:
+                # 即使磁盘 append 抛错也会清理：队列消费+落盘不是可回滚事务，
+                # 失败后不能指望原队列项还在；重新生成需要由外部重新提交源样本。
                 self.store.remove_eagle3_tensors(
                     sample.mooncake_key,
                     has_last_hidden_states="last_hidden_states" in sample.tensor_shapes,

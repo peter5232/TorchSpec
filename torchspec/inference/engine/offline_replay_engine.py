@@ -58,6 +58,8 @@ class OfflineReplayEngine(InferenceEngine, RayActor):
         self._dataset = OfflineDataset(self.args.offline_data_path)
         configure_offline_args(self._dataset, self.args)
         rows = self._dataset.rows("train") + self._dataset.rows("eval")
+        # 这里是启动时的索引快照；之后别的进程继续 append manifest，本 actor 不会自动发现新 ID。
+        # 控制器也从 manifest 建立训练条目，所以正常流程是先完成物化，再启动回放训练。
         self._rows_by_id = {str(row["data_id"]): row for row in rows}
         if len(self._rows_by_id) != len(rows):
             raise ValueError("Offline dataset contains duplicate data IDs across splits")
@@ -79,12 +81,16 @@ class OfflineReplayEngine(InferenceEngine, RayActor):
         if row is None:
             raise KeyError(f"Offline dataset has no record for data_id={data_id!r}")
         record = self._dataset.load(row)
+        # data_id 是稳定样本身份，key 是一次传输的身份：同一 "train-1" 在两个 epoch
+        # 会得到不同 key，避免上一轮消费者删除临时对象时误删下一轮已发布的同名对象。
         key = str(uuid.uuid4())
         tensors = {
             name: record.get(name)
             for name in ("input_ids", "hidden_states", "target", "last_hidden_states")
         }
 
+        # .pt 保留源 shape，put 仍会按传输契约把 hidden/target 转为 BF16（若需要）；
+        # 返回描述符必须取 store_meta，不能直接用文件内转换前的 dtype 描述实际传输字节。
         store_meta = self._mooncake_store.put(
             key=key,
             hidden_states=tensors["hidden_states"],
@@ -121,8 +127,13 @@ class OfflineReplayEngine(InferenceEngine, RayActor):
             return_logits,
             multimodal_inputs,
         )
+        # 控制器的离线条目只带 ID/seq_len，manager 仍经普通 generate 接口调度。
+        # 请求顺序如 ["b","a"]，返回也按 [b,a]；manager 用 zip 把输出与原输入配对，
+        # 所以此处无需在输出再带 data_id，但绝不能自行按 manifest 顺序重排结果。
         data_ids = data_id if isinstance(data_id, list) else [data_id]
         outputs = [self._replay_one(str(item)) for item in data_ids]
+        # 所有 put 后再统一等待发布完成；只有 flush 正常返回，manager 才收到可立即读取的 keys。
+        # 若中途某个 ID 缺失或 put/flush 失败，前面已发布的对象不会在此回滚；整批不是事务。
         self._mooncake_store.flush()
         return outputs
 

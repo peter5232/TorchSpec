@@ -111,6 +111,8 @@ def auto_calculate_training_steps(args, dataset_size: int):
     global_batch_size = args.global_batch_size
     steps_per_epoch = dataset_size // global_batch_size
 
+    # 至少 1 步只是调度数值兜底，不会复制样本补出完整 global batch。
+    # 太小的数据集能否凑齐窗口仍取决于控制器投递/重载规则，不能凭这个值认定输入已经足够。
     if steps_per_epoch == 0:
         logger.warning(
             f"Dataset size ({dataset_size}) < global_batch_size ({global_batch_size}). "
@@ -123,6 +125,8 @@ def auto_calculate_training_steps(args, dataset_size: int):
     current_num_train_steps = getattr(args, "num_train_steps", None)
     current_lr_total_steps = getattr(args, "lr_total_steps", None)
 
+    # 例数据 1000 条、global_batch=32，steps_per_epoch=31；显式总步数 40 得 num_epochs=2，
+    # 但最后一个 epoch 只跑 9 步。显式 lr_total_steps=100 仍保留，训练结束不代表调度器走到末尾。
     if current_num_train_steps is not None:
         args.num_epochs = math.ceil(current_num_train_steps / steps_per_epoch)
         logger.info(

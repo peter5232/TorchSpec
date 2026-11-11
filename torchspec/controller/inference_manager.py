@@ -68,6 +68,8 @@ class EnginePool:
             raise ValueError("engines must be non-empty")
         self._engines = engines
         self._next_idx = 0
+        # 两引擎、配置值 2 给出的是 4 个全局槽；慢引擎尚有请求时，轮询仍可能再次选它。
+        # 这个乘法不建立“每台最多 2 个”的独立约束，后端内部还可能继续排队。
         self._max_concurrent = max_concurrent_per_engine * len(engines)
         self._semaphore = asyncio.Semaphore(self._max_concurrent)
 
@@ -221,6 +223,8 @@ class AsyncInferenceManager:
             f"max_concurrent={self._engines.max_concurrent})"
         )
 
+        # 同一事件循环中有两条协程：补货在远程 get_prompts 时让出执行权，前台仍可收取推理结果。
+        # deque 是本 actor 的输入副本；controller 的 prompt_buffer 已在 get_prompts 中移走这些条目。
         refill_task = asyncio.create_task(self._continuous_refill())
 
         while self._running:
@@ -232,6 +236,8 @@ class AsyncInferenceManager:
 
             await self._collect_completed()
 
+        # 这是 while 正常退出后的收尾，不是 finally：task.result()/转发 RPC 抛异常会跳过此段。
+        # 因此 stop 的协作式 drain 不能被理解为任何异常退出都自动完成在途任务清理。
         refill_task.cancel()
         try:
             await refill_task
@@ -330,6 +336,9 @@ class AsyncInferenceManager:
             and len(self._pending_tasks) < self._engines.max_concurrent
         ):
             await self._await_pool_capacity()
+            # 容量 RPC 只是读当前池长，没有为将来的整批结果预留位置。
+            # 例池长 7、阈值 8、推理批长 4：检查通过，四条均成功回池后可以变成 11。
+            # 等待因 stop 返回时，这里也未重查 _running；不能把 stop 当成“从此绝不再发一批”的栅栏。
             entries = self._take_batch(self._batch_size)
             task = asyncio.create_task(self._dispatch_batch(entries))
             self._pending_tasks.add(task)
@@ -348,10 +357,14 @@ class AsyncInferenceManager:
         """Wait for at least one dispatch to finish and forward results."""
         # FIRST_COMPLETED 只要求至少一个完成，返回 done 可能包含多个已完成任务。
         # 后续将仍在运行的集合保留，下一次循环继续提交/收集，使快慢引擎都能持续工作。
+        # pending 是“已建但尚未收集”的任务集合，并非 GPU 当前执行批数：已完成任务也可能仍在其中。
+        # 返回后先把它们移出集合再转发；done 是集合，多批同时完成时不承诺原始提交顺序。
         done, self._pending_tasks = await asyncio.wait(
             self._pending_tasks, return_when=asyncio.FIRST_COMPLETED
         )
         for task in done:
+            # 普通引擎失败被包装成结果项，但 actor 死亡会让 task.result() 直接抛错；
+            # 此时同一 done 集合中尚未遍历的成功回包也不会由本循环继续转发。
             await self._forward_results(task.result())
 
     # 关闭阶段丢弃尚未提交的输入，等待已提交任务完成并转发结果；不再等待样本池空位。
@@ -392,6 +405,8 @@ class AsyncInferenceManager:
                     )
                 return
 
+        # 水位不是最大队长：水位 32、现有 30、refill_size=16 时会请求 16，返回后可达 46。
+        # await get_prompts 期间前台也可取走输入，所以最终队长应看实际 deque，而不是这次 need。
         need = self._buffer_low_watermark - len(self._prompt_buffer)
         fetch_size = max(need, self._refill_size)
         entries = await self.controller.get_prompts.remote(fetch_size)
@@ -417,6 +432,8 @@ class AsyncInferenceManager:
         if self._max_pool_size <= 0:
             return
 
+        # 这里按 controller 的 train+eval 待分发条目计数；不含本地 prompt、在途生成、
+        # 已完成未转发回包及已进入训练队列的对象，更不是 Mooncake 所有分片的物理占用。
         pool_size = await self.controller.get_pool_size.remote()
         if pool_size < self._max_pool_size:
             return
@@ -490,7 +507,10 @@ class AsyncInferenceManager:
         self, entries: list[InferenceInput]
     ) -> list[tuple[InferenceInput, dict | Exception]]:
         """Send a batch to the next engine and return (entry, output) pairs."""
+        # 槽从准备参数到远程返回/异常都被占用；async with 在离开时释放，结果转发不占此槽。
+        # _pending_tasks 仍需前台 collect 才移除，因此 semaphore 空闲不等于可立刻再建一个 task。
         async with self._engines.semaphore:
+            # 参数准备与引擎选择在下方 try 之外；这里出错会直接失败 task，不会变成逐样本 Exception。
             kwargs = self._prepare_engine_inputs(entries)
             engine = self._engines.pick()
 
@@ -519,12 +539,16 @@ class AsyncInferenceManager:
                     )
                     err = ValueError(f"output count mismatch: {len(outputs)} vs {len(entries)}")
                     return [(entry, err) for entry in entries]
+                # 例如输入 [A,B,C]、回包 [A结果,None,C结果]，仍严格保留三个位置。
+                # 下游才过滤 B；若这里先压缩输出，C 会与错误的 data_id/mask 配对。
                 return list(zip(entries, outputs, strict=True))
             # 进程死亡与单批失败不能采用同一种处理：actor 死亡说明生产者能力已丢失，
             # 必须让控制器把错误传给训练主循环，否则训练 rank 可能永远等待下一份样本。
             except RayActorError as e:
                 logger.critical(f"Engine actor died, terminating inference manager: {e}")
                 self._running = False
+                # 先把致命错误写进共享控制器，再重新抛出；训练 loop 下一次 try_dispatch_batch
+                # 会看到它。普通批次异常走下方返回值通道，没有这个全局停止信号。
                 await self.controller.set_inference_error.remote(str(e))
                 raise
             except Exception as e:
@@ -572,6 +596,8 @@ class AsyncInferenceManager:
             if inference_result is not None:
                 inference_results.append(inference_result)
 
+        # 这是结果元数据的交接点，不会重新 PUT 张量；失败样本也不会在这里放回 prompt 队列。
+        # 对 vLLM 而言 key 可先于后台字节发布完成返回，训练读取仍须遵守 store 的逐键等待。
         if inference_results:
             await self.controller.push_inference_results.remote(inference_results)
             logger.debug(f"Forwarded {len(inference_results)} results to controller")

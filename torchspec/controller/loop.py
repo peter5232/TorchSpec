@@ -79,12 +79,17 @@ def _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engi
         return
 
     # NOTE: uses local tmp dir; for multi-node, ensure output_dir is on shared filesystem.
+    # mkdtemp 没有传 dir=args.output_dir，实际位置取系统临时目录；只配置共享 output_dir
+    # 并不会自动让此路径共享。其他节点能否读取，要以 tmp_dir 的真实挂载位置为准。
     tmp_dir = tempfile.mkdtemp(prefix="draft_weight_sync_")
     try:
         logger.info(f"Step {completed_steps}: saving draft model to {tmp_dir}")
         train_group.save_draft_model_for_serving(tmp_dir)
 
         logger.info(f"Step {completed_steps}: updating {len(inference_engines)} engine(s)")
+        # 正常返回才表示所有更新 RPC 完成；任一 RPC 抛错时，其余请求可能仍在进行。
+        # 这不是跨引擎事务：A 成功而 B 失败时不回滚 A，后续样本不保证来自同版 draft；
+        # 异常后 finally 仍删除临时目录，也不能把目录删除当成所有引擎已停止读盘的证据。
         update_results = ray.get(
             [engine.update_weights_from_disk.remote(tmp_dir) for engine in inference_engines]
         )
@@ -143,6 +148,8 @@ def _safe_training_cleanup(
     args, inference_manager, inference_future, inference_engines=None
 ) -> None:
     """Best-effort teardown for inference manager and mooncake master actor."""
+    # “best effort”指遇到异常继续尝试后续资源，并不代表每个阶段都有超时。
+    # 下方 stop/run 的 ray.get 没指定 timeout；若任务一直不返回，后续 shutdown 尚不能执行。
     if inference_manager is not None:
         try:
             ray.get(inference_manager.stop.remote())
@@ -249,6 +256,9 @@ def training_loop(
     # Resume is best-effort: completed optimizer steps determine epoch/skip, but
     # async prompt/result buffers can still lose or replay a small tail.
     start_step = ray.get(train_group._actor_handlers[0].get_global_step.remote())
+    # 例 steps_per_epoch=10、global_batch=12、global_step=13：从 epoch 索引 1 跳过 36 条。
+    # 这只重建输入游标；checkpoint 没保存 prompt/result/训练队列快照，不能据此证明逐样本续跑一致。
+    # resume_epoch 是传给 shuffle 的零起点索引，后面的 current_epoch 是日志用一开始计数。
     resume_epoch = start_step // steps_per_epoch if steps_per_epoch > 0 else 0
     resume_skip = (start_step % steps_per_epoch) * args.global_batch_size if start_step > 0 else 0
     ray.get(controller.submit_training_dataset.remote(epoch=resume_epoch, skip=resume_skip))
@@ -263,6 +273,8 @@ def training_loop(
     enable_perf = getattr(args, "enable_perf_metrics", True)
     # 即便配置不额外预取，也至少凑齐一次 optimizer step 所需的累积批次。
     # 例如累积=3、prefetch_depth=1，实际至少备 3 个 dispatch，才能让所有 rank 完成本次更新。
+    # 此处的 prefetch 单位是“每个 DP rank 一次供料”的 dispatch，训练器内部预取队列则装
+    # 已 collate 的本 rank batch；同一配置值用在两个层次，不能把两个队列想成同一个容器。
     prefetch_batches = max(accumulation_steps, getattr(args, "prefetch_depth", 0))
 
     completed_steps = start_step
@@ -283,6 +295,9 @@ def training_loop(
             num_steps - completed_steps,
             steps_per_epoch - steps_in_current_epoch,
         )
+        # 例如 K=3、prefetch=5，正常目标是 5 个 dispatch；只剩 1 步时缩到 3。
+        # queued_batches 是 driver 已投递且未用训练 RPC 结算的计数，不是远程 Queue.qsize()：
+        # 训练侧后台线程可能已提前读走数据，但这些 batch 尚未完成一次参数更新。
         target_queued_batches = min(
             prefetch_batches,
             remaining_steps * accumulation_steps,
@@ -340,6 +355,9 @@ def training_loop(
                     )
                     should_reload = True
 
+                # 500 次失败是轮询次数，不是可靠的“所有在途推理已经结束”证明。
+                # 此分支只查看 pool/prompt 等条件，未核对 inference manager 的在途引用；
+                # 慢请求仍可能返回。重载保留已排队的部分累积窗口，不能视为整套流水线清空。
                 if should_reload:
                     if completed_steps < num_steps:
                         current_epoch += 1
@@ -352,6 +370,9 @@ def training_loop(
                         break
 
                 time.sleep(0.01)
+        # Python 的 while...else 在条件自然变 False 时执行，内部 break 则跳过它。
+        # 当额外预取失败但已凑够 K 批时，上面把 target 改成现有计数并 continue，
+        # 下一次条件为 False，于是到这里开算；不是把该次训练跳过。
         else:
             # The current optimizer step is fully queued.
             if enable_perf:
@@ -370,6 +391,9 @@ def training_loop(
             # 每个 actor 内部做前向/反向和同步通信；driver 在这里等待整组完成。
             # 先向所有 rank 提交再统一等待，不能在创建列表时逐个等待，否则首个 rank 可能卡在 collective。
             train_results = ray.get(train_futures)
+            # 例进入训练前 queued=5、K=3：RPC 返回后剩 2，下轮只需补 3 才重回目标 5。
+            # 这是正常完整窗口的计账；driver 没逐个检查每个 actor 实际执行了多少 backward。
+            # 如队列意外提前结束，训练器自己的边界行为仍须单独核对，不能由计数假定完成。
             queued_batches -= accumulation_steps
             completed_steps += 1
 
@@ -418,6 +442,8 @@ def training_loop(
 
             # ── Eval at explicit interval (if configured) ─────────
             # Skip if a checkpoint save is about to run (it will eval anyway)
+            # 如 eval_interval=2、save_interval=3，第 6 步不在这里 eval，交给保存分支统一执行。
+            # 独立评估分支只记日志，不调用 update_checkpoint_eval_meta；best 指向的是有保存的候选。
             save_due = _is_save_interval_step(completed_steps, args.save_interval)
             if eval_interval > 0 and completed_steps % eval_interval == 0 and not save_due:
                 run_eval(completed_steps, train_group, eval_enabled)
@@ -446,6 +472,8 @@ def training_loop(
                 eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
                 logger.info(f"Saving checkpoint at step {completed_steps}...")
                 train_group.save_model(completed_steps)
+                # last_saved_step 只在保存 RPC 正常返回后更新，避免同一步的 epoch/final 再写一次。
+                # 它是本次运行内存状态，不是从磁盘扫描出来的“所有历史保存步骤”集合。
                 last_saved_step = completed_steps
                 best_eval_score = update_checkpoint_eval_meta(
                     args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
@@ -495,6 +523,8 @@ def training_loop(
         # Inner while broke (max steps reached during reload), break outer loop
         break
 
+    # 这次 flush 只兑现最后一份延迟指标，不再 backward 或 optimizer.step。
+    # 如最后一次 RPC 提交的是 step 20 而返回 step 19 指标，不 flush 就会遗漏 step 20 的日志。
     final_train_results = train_group.flush_pending_train_metrics()
     if not isinstance(final_train_results, (list, tuple)):
         final_train_results = []
@@ -516,6 +546,8 @@ def training_loop(
     if args.checkpoint_dir and last_saved_step != completed_steps:
         eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
         logger.info(f"Saving final checkpoint at step {completed_steps}...")
+        # force_sync 目前是兼容参数：Trainer.save_model 直接调用同步 checkpoint.save。
+        # 等待来自整组 ray.get 和同步 DCP 保存，不是该布尔值另开了一条更强的持久化路径。
         train_group.save_model(completed_steps, force_sync=True)
         best_eval_score = update_checkpoint_eval_meta(
             args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
@@ -532,7 +564,8 @@ def training_loop(
     )
 
 
-# 启动后台推理后进入同步训练循环；try/finally 确保正常退出和异常退出都执行资源清理。
+# 启动后台推理后进入同步训练循环；进入 try 后的正常/异常退出都执行清理。
+# run.remote() 的提交在 try 外，若提交本身同步失败，不经过下面的 finally。
 def run_training_loop(
     args,
     controller,

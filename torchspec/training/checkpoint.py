@@ -78,6 +78,9 @@ class OptimizerState(Stateful):
     # BF16 路径额外按参数名保存 master，避免冻结策略改变时仅靠列表位置误配。
     # 普通优化器则由分布式 get_state_dict 提取优化器状态。
     def state_dict(self):
+        # 模型 state_dict 只含前向使用的参数；Adam state_dict 主要含 moments/step/参数组，
+        # 不会替独立 FP32 master 保存参数值，所以这里需要第三份按名字索引的权重。
+        # 例如 model 的 BF16 值为 1.0，master 可能仍是 1.001；两者不能互相无损重建。
         if self._is_bf16_optimizer:
             names = _fp32_param_names(self.optimizer)
             return {
@@ -96,8 +99,12 @@ class OptimizerState(Stateful):
     # 参数冻结集合不同的模型不能被当作完全相同的优化器续训，可改走 continual training。
     def load_state_dict(self, state_dict):
         if self._is_bf16_optimizer:
+            # 顺序很重要：底层 Adam 的加载先执行，随后才检查 master 名字完整性。
+            # 若后续检查/拷贝失败，本函数不会撤销已装入的参数组或 moments；它不是事务。
             self.optimizer.load_state_dict(state_dict["optim"])
             saved = state_dict.get("fp32_params")
+            # 只有存在且非空的 fp32_params 才进入恢复；缺字段并不会在此主动报错或
+            # 从模型同步。正常新格式应携带它，不能把“Adam 状态加载成功”当作 master 已恢复。
             if saved:
                 names = _fp32_param_names(self.optimizer)
                 missing = [name for name in names if name not in saved]
@@ -151,6 +158,8 @@ def _read_checkpoint_metadata(path: Path) -> dict[str, Any]:
 
 # 先写相邻临时 JSON 文件，再原子替换目标，避免读者读到半份元数据。
 def _write_checkpoint_metadata(path: Path, metadata: dict[str, Any]) -> None:
+    # replace 只发布这一个 JSON 文件；它没有把 model/optimizer/RNG/tracker 打包成事务。
+    # 此处也没有显式 fsync 或并发写者锁，不能把“读不到半份 JSON”扩展成掉电持久性保证。
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
     tmp_path.replace(path)
@@ -365,6 +374,8 @@ def resolve_resume_model_dir(args: Any) -> Path | None:
         return None
 
     target_step = getattr(args, "ckpt_step", None)
+    # 指定 ckpt_step 就直接访问该编号，不扫描可用目录，也不挑选最近一个“完整”快照。
+    # 默认路径则信任 tracker 的整数内容；空串/非整数会在 int() 处抛出，不会自动退回旧步。
     if target_step is None:
         tracker_file = root_path / "latest_checkpointed_iteration.txt"
         if not tracker_file.exists():
@@ -373,6 +384,8 @@ def resolve_resume_model_dir(args: Any) -> Path | None:
         target_step = int(tracker_file.read_text().strip())
 
     model_dir = root_path / f"iter_{target_step:07d}" / "model"
+    # exists 只检查目录可见，不验证 DCP 的 .metadata 或各 rank 分片完整性。
+    # 保存失败可留下已创建的目录；是否真能恢复，仍要由下面 load 中的 dcp.load 判断。
     if not model_dir.exists():
         logger.info(f"Model checkpoint {model_dir} not found; skipping load.")
         return None
@@ -401,10 +414,14 @@ def load(actor: Any) -> dict[str, Any] | None:
     model_state = ModelState(actor.model)
     state_dict = {"model_state": model_state}
 
+    # 所有训练 rank 都调用本入口；DCP 负责按当前分布式布局恢复，并非只有 rank 0 读完整权重。
+    # model、optimizer、scheduler 依次加载，不存在“全部成功后再一次性替换内存”的提交阶段。
     try:
         dcp.load(state_dict=state_dict, checkpoint_id=str(model_dir))
         logger.info(f"Loaded model from {model_dir}")
     except Exception as e:
+        # 失败被转为 None，但这里没有恢复 load 前的参数副本；若底层已部分写入，
+        # None 仅表示未获得完整恢复载荷，不能证明 actor.model 仍是完整的初始化状态。
         logger.error(f"Failed to load model from {model_dir}: {e}")
         return None
 
@@ -439,6 +456,9 @@ def load(actor: Any) -> dict[str, Any] | None:
             "start a fresh optimizer from these weights."
         )
 
+    # Adam 与 scheduler 各有状态：前者含每参数的 step/moments 和当前组 lr，
+    # 后者含曲线配置/推进计数。下方允许 scheduler 缺失或失败，因此“普通 resume”
+    # 也不无条件保证下一步学习率与原训练相同；不能只核对模型数值就断言轨迹完全续接。
     # Load LR scheduler state (optional)
     load_lr_scheduler = (
         not continual_training and hasattr(actor, "lr_scheduler") and lr_scheduler_dir.exists()
@@ -460,6 +480,8 @@ def load(actor: Any) -> dict[str, Any] | None:
     # 这避免模型构造或权重加载过程中额外消耗随机数后，误以为 RNG 已精确恢复到训练边界。
     rng_state = None
     rng_path = checkpoint_dir / "rng.pt"
+    # rng.pt 是 rank 0 写的一份 torch CPU/CUDA 状态，所有 rank 读同一路径。
+    # 它未记录 Python random、NumPy、数据队列、teacher 推理进度或各 rank 独立 RNG。
     if rng_path.exists():
         rng_state = torch.load(rng_path, map_location="cpu")
 
@@ -502,7 +524,12 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
             ]
             optim_state = OptimizerState(actor.model, opt)
             optim_sd = {"optim_state": optim_state}
+            # 假设新配置 lr=1e-4，旧快照 lr=2e-5 且 Adam step=500：此临时加载
+            # 会把旧组配置/moments 一起装入；成功后下面恢复新 lr 并丢弃旧 step/moments，
+            # 只让精确 master 留下。因此 continual training 不是把旧 optimizer 接着走。
             dcp.load(state_dict=optim_sd, checkpoint_id=str(optim_dir))
+            # 保留加载后参数组的 params 引用，而非 deepcopy 参数对象；Adam 的 state 以这些
+            # tensor 对象为键，换成数值相同的新 tensor 也不是同一组待更新参数。
             for group, fresh_group in zip(opt.optimizer.param_groups, fresh_param_groups):
                 params = group["params"]
                 group.clear()
@@ -512,6 +539,9 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
             opt.optimizer.state.clear()
             logger.info(f"Loaded fp32 master params from {optim_dir}")
             return
+        # 异常分支只记录日志后走权重同步，没有 finally 回滚 fresh_param_groups/state。
+        # 若 load 在修改 Adam 后才失败，下面的 fallback 能纠正 master 数值，
+        # 却不保证组超参数和 moments 仍是新配置；“新优化器”保证限于上方成功路径。
         except Exception as e:
             logger.warning(f"Failed to load fp32 params from optimizer checkpoint: {e}")
 
@@ -531,6 +561,9 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
 
     continual_training = getattr(actor.args, "continual_training", False)
 
+    # 恢复 RNG 只把生成器拨回记录位置，不会重放异步采样/队列调度的历史。
+    # Eagle/DFlash 的 init_model 在 finalize_load 后还会初始化 teacher head；
+    # 因而也不能仅凭此调用就保证之后直到第一批训练都不再消耗随机数。
     if checkpoint_payload.get("rng") is not None and not continual_training:
         rng_state = checkpoint_payload["rng"]
         if "torch" in rng_state:
@@ -542,9 +575,14 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
     iteration = checkpoint_payload.get("iteration")
     if metadata and not continual_training:
         actor.global_step = int(metadata.get("global_step", actor.global_step))
+        # global_step 是 actor 的优化器窗口计数；next_step 写到 args 是另一种进度字段。
+        # controller/loop.py 实际通过 get_global_step() 初始化 completed_steps 和数据跳过量，
+        # 不直接把 args.start_step 当作本轮控制器的训练计数。
         next_step = metadata.get("next_step") or metadata.get("next_inference_id")
         if next_step is not None:
             actor.args.start_step = next_step
+    # 旧格式没有 metadata 时，兼容分支只补 args.start_step，未给 global_step 赋 iteration。
+    # 所以仅凭 iter_0000101 目录名，不能推导控制器一定从第 101 个窗口继续。
     elif iteration is not None and not continual_training:
         if getattr(actor.args, "start_step", None) is None:
             actor.args.start_step = iteration
@@ -564,11 +602,17 @@ def save(actor: Any, step: int) -> None:
     Saves model weights and optimizer state to separate directories.
     This allows loading weights without optimizer or deleting optimizer before loading.
     """
+    # 这里调用的是同步 dcp.save，不创建后台 Future，也不在复制尚未结束时返回。
+    # Ray 层先拿各 actor 的 ObjectRef 再 ray.get；它们表示远程调用完成，不是文件发布标记。
+    # Trainer 的 _eval_cache_save_future 属于另一个 CPU 评估缓存流程，不能混作 checkpoint 完成证据。
     torch.cuda.synchronize()
 
     base_dir = Path(actor.args.checkpoint_dir).expanduser()
     # 外部 step 可能是 0 起点，目录用下一边界号；metadata 同时保存 step 与 next_step。
     # 恢复时要看 next_step/global_step 的用途，不能仅把目录编号当作训练过程中所有计数器。
+    # 当前控制器已经把 completed_steps 加一后再调用 save_model(completed_steps)。
+    # 如已完成 100 个窗口且 global_step=100，传 step=100 会创建 iter_0000101，
+    # meta 中 next_step=101、global_step=100；目录号和实际完成窗口数在该调用链相差一。
     step_id = step + 1
     checkpoint_dir = base_dir / f"iter_{step_id:07d}"
     model_dir = checkpoint_dir / "model"
@@ -580,6 +624,8 @@ def save(actor: Any, step: int) -> None:
         model_dir.mkdir(parents=True, exist_ok=True)
         optimizer_dir.mkdir(parents=True, exist_ok=True)
         lr_scheduler_dir.mkdir(parents=True, exist_ok=True)
+    # 首个 barrier 协调目录创建；它不是磁盘锁，也不能让目录创建与后面的数据写入原子可见。
+    # 三个 DCP 子目录分别保存，中途失败可能只留下 model 或 model+optimizer。
     dist.barrier()
 
     # Save model weights
@@ -600,6 +646,8 @@ def save(actor: Any, step: int) -> None:
         dcp.save(lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir))
 
     if dist.get_rank() == 0:
+        # get_rng_state_all 的 all 是当前进程可见的 CUDA 设备，不是跨训练 rank 的 all-gather。
+        # 只写 rank 0 的生成器状态意味着不能恢复保存时各 rank 原本不同的随机流。
         rng_state = {"torch": torch.get_rng_state()}
         rng_state["cuda"] = torch.cuda.get_rng_state_all()
         torch.save(rng_state, checkpoint_dir / "rng.pt")
@@ -619,6 +667,9 @@ def save(actor: Any, step: int) -> None:
         # 模型、optimizer、scheduler、RNG 和 metadata 都写完后才更新 latest tracker。
         # tracker 给下次启动提供默认恢复入口；显式 ckpt_step 则可以绕过它选择历史目录。
         tracker_file = base_dir / "latest_checkpointed_iteration.txt"
+        # 与 meta.json 不同，这里直接覆盖文本，没有临时文件+replace。
+        # 崩溃可能留下空/损坏 tracker；显式 ckpt_step 还可绕过它访问未发布目录。
+        # 因此“tracker 最后写”是正常成功路径的顺序约定，不是整个目录树的原子提交协议。
         tracker_file.write_text(str(step_id))
         logger.info(f"Saved checkpoint to {checkpoint_dir}")
 

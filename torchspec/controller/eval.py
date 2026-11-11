@@ -59,6 +59,8 @@ class EvalSetupState:
 def _check_idle_timeout(
     dispatched_samples: int, last_progress_at: float, total_samples: int
 ) -> None:
+    # monotonic 不受系统时间校准影响；此检查只在 try_dispatch 返回 False 后被调用。
+    # 若某个 ray.get/cache_eval_samples 本身挂住，本函数没有机会运行，并非 RPC 的全局 deadline。
     idle_for = time.monotonic() - last_progress_at
     if idle_for >= EVAL_CACHE_IDLE_TIMEOUT:
         raise TimeoutError(
@@ -82,6 +84,8 @@ def update_checkpoint_eval_meta(
         return current_best
 
     base_dir = Path(checkpoint_dir).expanduser()
+    # 例 loop 已完成第 20 次更新并传 step=20，checkpoint.save 写 iter_0000021，
+    # 此处必须命中同一目录；元数据 global_step 仍可为 20。目录号与优化器更新数不是同一字段。
     step_id = step + 1
     meta_path = base_dir / f"iter_{step_id:07d}" / "meta.json"
 
@@ -96,6 +100,8 @@ def update_checkpoint_eval_meta(
     _write_checkpoint_metadata(meta_path, metadata)
 
     score = eval_metrics.get("eval/simulated_acc_len")
+    # 相等不刷新 best；若本次只有 avg_loss 而没有 simulated_acc_len，也不按 loss 自动选优。
+    # best 文件只是指向目录的记录，后面的 max_checkpoints 按新旧清理时没有读取该指针保护它。
     if score is not None and score > current_best:
         current_best = score
         (base_dir / "best_checkpointed_iteration.txt").write_text(str(step_id))
@@ -132,12 +138,17 @@ def generate_eval_cache(
     while dispatched_samples < eval_dataset_size:
         ok = ray.get(controller.try_dispatch_eval_batch.remote())
         if ok:
+            # controller 加载评估集时先截成 DP 数的整倍数，正常启用时 dispatch_bs=DP，
+            # 因而每 rank 每次缓存 1 项；USP 的多个 SP rank 各取同一逻辑样本的不同片段。
+            # 若绕开 loader 直接传小于 DP 的正数，整数除法会变 0，不能视为受支持的小尾批。
             train_group.cache_eval_samples(dispatch_bs // dp_size)
             dispatched_samples += dispatch_bs
             if next_submit_idx < eval_dataset_size:
                 next_end = min(next_submit_idx + dispatch_bs, eval_dataset_size)
                 ray.get(controller.submit_eval_chunk.remote(next_submit_idx, next_end))
                 next_submit_idx = next_end
+            # 进展在远程消费完成后才更新，而非仅仅发出一次推理请求时更新。
+            # 例如 600 秒总耗时中每 20 秒完成一批，不触发 300 秒无进展超时。
             last_progress_at = time.monotonic()
             eval_progress.update(dispatch_bs)
         else:
@@ -184,6 +195,8 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
     eval_cache_loaded = False
     initial_eval_submit_count = 0
 
+    # 例原验证集 10 条、DP=4，controller 只保留 8 条，这里每次分发 4 条、共两轮。
+    # 原验证集仅 3 条时 controller 截为 0，会关闭评估，而不是给部分 rank 送空批凑数。
     eval_dispatch_bs = min(args.dp_size, eval_dataset_size)
 
     best_eval_score = -float("inf")
@@ -207,6 +220,8 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
             # Hydra exposes YAML sequences as OmegaConf ListConfig objects,
             # which json.dumps cannot serialize directly.
             aux_hidden_states_layers = list(aux_hidden_states_layers)
+        # MD5 只编码下面几个配置字符串：原文件在同路径改了内容或 teacher 同路径换了权重，
+        # key 不会因此变化；DP/SP 拓扑也不在该 key 中，缓存命中不是完整运行配置兼容性证明。
         cache_key = hashlib.md5(
             f"{data_source}|"
             f"{getattr(args, 'target_model_path', '')}|"
@@ -218,6 +233,8 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
         loaded = train_group.load_eval_cache(eval_cache_path)
         # 评估是分布式操作：只有所有 rank 都有缓存才算整体命中。
         # 单个 rank 缺缓存不能直接开始评估，否则各 rank 输入步数不同可能卡在聚合。
+        # 代码只检查各 rank 的返回计数为正，没有在此断言数量相等或与当前 eval 集完全一致。
+        # “所有 rank 都加载成功”和“数据/拓扑与缓存生成时一致”是两个需要分别核对的条件。
         if all(n > 0 for n in loaded):
             eval_cache_loaded = True
             logger.info(
