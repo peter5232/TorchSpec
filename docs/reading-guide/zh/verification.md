@@ -83,3 +83,11 @@ python3 -m pytest tests/test_ci_convergence.py tests/test_target_hidden.py tests
 10 个文件与本轮基线的 AST、有效 token 完全一致，语法编译通过；教程全部 586 个本地链接有效。完整 pre-commit hooks 与 `git diff --check` 通过，两个既有收敛轨迹测试再次通过。交叉审阅补明了 RPC 组异常返回不代表其他调用已结束，以及 try 之前的提交失败不经过 finally。
 
 checkpoint、异步队列和离线磁盘故障场景均为依据源码的推演；没有运行 GPU/分布式恢复、网络故障注入或断电测试。现有实现的非事务边界仅加以解释，本轮不修改其行为。
+
+## 第四轮：attention、张量布局与分布式（2026-11-18）
+
+在 `d7caf0e` 上深化 8 个 Python 文件，净增加 179 行注释，另新增布局、EAGLE attention、DFlash/DFlash2 骨干、八 rank 分布式四篇演算。修正了原先将 USP 补齐 mask 标零直接等同于 attention 已屏蔽的过强表述；实际是否读取 mask 取决于后端。
+
+本轮文件的 AST、有效 token 与基线一致，语法编译通过；另外对初始基线 a4e5c108 的全部 Python 改动复核也保持等价。全部教程的 612 个本地链接有效，完整 pre-commit hooks 与 diff 空白检查通过。两个既有收敛轨迹测试通过，标准库另复算了切片坐标、通信形状元素数、梯度除数、动态卷积和 selector 数值例子。交叉复核了 Flash 合并前反向、GQA 组维求和以及 USP 的通信前后坐标。
+
+本轮不新增或修改运行逻辑。前向/反向 GPU kernel、多卡通信和不同 attention 后端的数值对照未实际运行；文档只说明当前实现的契约及可手算推导，不宣称所有 padding、空洞 mask、mRoPE 或 FSDP/USP 组合都等价。

@@ -38,6 +38,8 @@ _SP_RING_GROUP = None
 def init_gloo_group():
     """Initialize Gloo group for distributed communication."""
     global GLOO_GROUP
+    # 这是每个 Python 进程内的缓存，不是跨 rank 共享的全局变量。
+    # 各 actor 都会走初始化；某个 rank 缓存命中不代表其他 rank 自动完成了 new_group。
     if GLOO_GROUP is None:
         GLOO_GROUP = dist.new_group(backend="gloo")
     return GLOO_GROUP
@@ -96,6 +98,8 @@ def _build_usp_group_ranks(
     ring_groups: list[list[int]] = []
     num_ulysses_pgs = sp_ring_size
     num_ring_pgs = sp_ulysses_size
+    # 以 world=8,U=2,R=2 为例，base_rank 为 0 和 4，各自代表独立数据副本。
+    # 此函数只生成 Python rank 列表，不创建 process group；实际初始化在 init_usp_groups。
     for base_rank in range(0, world_size, sp_size):
         draft_sp_groups.append(list(range(base_rank, base_rank + sp_size)))
         for idx in range(num_ulysses_pgs):
@@ -121,6 +125,8 @@ def init_usp_groups(sp_ulysses_size: int = 1, sp_ring_size: int = 1):
     global _SP_ULYSSES_GROUP, _SP_RING_GROUP
 
     sp_size = sp_ulysses_size * sp_ring_size
+    # 这里只清本模块引用，不调用 destroy_process_group，也不重置 Yunchang 的全局对象。
+    # 因此这是初始化期“无 SP”分支，不应当作运行中安全拆除/重配拓扑的完整协议。
     if sp_size == 1:
         _USP_DEVICE_MESH = None
         _USP_GRAD_SYNC_MESH = None
@@ -151,6 +157,9 @@ def init_usp_groups(sp_ulysses_size: int = 1, sp_ring_size: int = 1):
         (draft_dp_size, sp_size),
         mesh_dim_names=("draft_dp", "draft_sp"),
     )
+    # 默认按全局 rank 顺序铺 mesh：[[0,1,2,3],[4,5,6,7]]。
+    # draft_sp 沿行通信，[0,1,2,3] 同处一份序列；draft_dp 沿列通信，
+    # 例如 [2,6] 是两个数据副本上相同 SP 坐标，不能把这个两人组当完整序列组。
     _DRAFT_SP_GROUP = _USP_DEVICE_MESH.get_group("draft_sp")
     # 梯度同步单独用全 rank 一维 mesh：同一样本不同序列片段都对同一套模型参数有贡献。
     # attention 的 SP 交换与参数梯度归约不是同一个通信阶段，也不能复用相同除数的直觉。
@@ -174,6 +183,8 @@ def init_usp_groups(sp_ulysses_size: int = 1, sp_ring_size: int = 1):
     )
     _SP_ULYSSES_GROUP = YUNCHANG_PROCESS_GROUP.ULYSSES_PG
     _SP_RING_GROUP = YUNCHANG_PROCESS_GROUP.RING_PG
+    # 校验读取 Yunchang 真正创建的组，不把 _build_usp_group_ranks 的预期列表当实际拓扑。
+    # 但下面只验证组成员不越出 SP 边界，尚不能证明组大小/顺序都等于低位 Ulysses 约定。
     _validate_usp_group_composition()
 
     return _DRAFT_SP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP
@@ -227,6 +238,8 @@ def get_usp_rank_coords(sp_rank: int, sp_ulysses_size: int, sp_ring_size: int) -
     sp_size = sp_ulysses_size * sp_ring_size
     if sp_rank < 0 or sp_rank >= sp_size:
         raise ValueError(f"sp_rank must be in [0, {sp_size}), got {sp_rank}")
+    # 这里必须传组内 sp_rank。上例全局 rank 6 在 SP=[4,5,6,7] 中是 2，
+    # 故坐标为 (U=0,Ring=1)；直接传全局 6 会越过 SP=4 的范围而报错。
     ulysses_rank = sp_rank % sp_ulysses_size
     ring_rank = sp_rank // sp_ulysses_size
     return ulysses_rank, ring_rank
@@ -236,6 +249,8 @@ def get_usp_rank_coords(sp_rank: int, sp_ulysses_size: int, sp_ring_size: int) -
 def _gather_group_members(group) -> tuple[int, ...]:
     group_world_size = dist.get_world_size(group)
     members = [None] * group_world_size
+    # 收集值是全局 rank，但输出列表按该 group 的成员位置排列；例如 [2,6]，
+    # 本地组 rank 1 的值是 6。传的是指定组，不会因为 payload 是 Python 对象就自动用 Gloo。
     dist.all_gather_object(members, dist.get_rank(), group=group)
     return tuple(members)
 
@@ -257,6 +272,8 @@ def _validate_usp_group_composition() -> None:
     }
     records = [None] * dist.get_world_size(sp_group)
     dist.all_gather_object(records, local_record, group=sp_group)
+    # 每个 SP 成员都贡献自己看到的 Ring/Ulysses 组，因此可发现某成员误接另一数据副本。
+    # 这里只做集合包含检查：组内顺序错、组过小等仍可能满足条件，不能把成功视为完整拓扑证明。
     for record in records:
         ring_members = tuple(record["ring_members"])
         ulysses_members = tuple(record["ulysses_members"])

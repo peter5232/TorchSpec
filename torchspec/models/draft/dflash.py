@@ -119,6 +119,8 @@ class DFlashRotaryEmbedding(nn.Module):
     def _set_cos_sin_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
         self.max_seq_len_cached = seq_len
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        # D=4 时频率是 [1,base^(-1/2)]，复制后通道排列为 [f0,f1,f0,f1]。
+        # 因此 _rotate_half 配对 (0,2)/(1,3)，不是把相邻 (0,1)/(2,3) 当一对。
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
@@ -165,6 +167,8 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return hidden_states
     batch, num_kv_heads, slen, head_dim = hidden_states.shape
+    # Hkv=2、重复数 2 时对应头序为 [kv0,kv0,kv1,kv1]，并非 [kv0,kv1,kv0,kv1]。
+    # expand 本身是广播视图；紧接 reshape 合并头轴可能物化，不能笼统称整段零拷贝。
     hidden_states = hidden_states[:, :, None, :, :].expand(
         batch, num_kv_heads, n_rep, slen, head_dim
     )
@@ -191,6 +195,8 @@ class DFlashAttention(nn.Module):
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
 
+        # H 是残差宽度，D 是每头宽度；显式 head_dim 可使 Hq*D 不等于 H。
+        # q_proj/o_proj 成对跨越这两个宽度，不能按惯例把中间 Q 的最后两维直接 reshape 成 H。
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
@@ -225,6 +231,8 @@ class DFlashAttention(nn.Module):
             context_position_ids: [B, ctx_len] — position IDs for context tokens
             block_mask: FlexAttention BlockMask for block-causal attention
         """
+        # 贯穿本函数的例子：B=1、context S=8、draft T=6、H=16、Hq=4、Hkv=2、D=4。
+        # 两输入分别是 [1,6,16]/[1,8,16]；最终只返回六个 draft 位置，不返回八个 context 输出。
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
 
@@ -232,6 +240,8 @@ class DFlashAttention(nn.Module):
         # Q 只有 N*K 行，不为完整 context 再计算查询；教师 context 只是被读取的记忆。
         q = self.q_proj(draft_hidden)
         q = q.view(bsz, draft_len, self.num_heads, self.head_dim)
+        # 例中线性输出 [1,6,16]，拆头 [1,6,4,4]；norm 只在最后的 D=4 上求均方。
+        # gamma 也是 [D]，跨 token 和 head 共享；它不是对四个头一起做归一化。
         q = self.q_norm(q).transpose(1, 2)  # [B, num_heads, draft_len, head_dim]
 
         # K/V from both context and draft (shared projections)
@@ -243,17 +253,24 @@ class DFlashAttention(nn.Module):
 
         # Concatenate K and V along sequence dimension BEFORE normalization
         # This matches SpecForge: concat → K-norm → RoPE
+        # 例中 K_ctx=[1,8,8]、K_draft=[1,6,8]，拼成 [1,14,8]，随后拆为两个 KV 头。
+        # “共享投影”只指当前 attention 内两次调用同一参数；不同 decoder 层仍各有自己的 K/V 权重。
         k = torch.cat([k_ctx, k_draft], dim=1)  # [B, ctx+draft, kv_dim]
         v = torch.cat([v_ctx, v_draft], dim=1)
 
         total_len = ctx_len + draft_len
         k = k.view(bsz, total_len, self.num_kv_heads, self.head_dim)
         k = self.k_norm(k).transpose(1, 2)  # [B, num_kv_heads, ctx+draft, head_dim]
+        # K norm 后是 [1,2,14,4]；V 同形状但不做 K norm，也不参加后面的 RoPE。
+        # 这条实现每次 forward 重算 context KV，没有把上一调用的 KV cache 留在模块内。
         v = v.view(bsz, total_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         # RoPE with concatenated position IDs (context + draft)
         # 物理 KV 顺序与语义坐标分别保存：context 后接 draft，后者坐标可重复或回退到较早 anchor。
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+        # 查表长度取 S+T，而非 max(position_ids)+1；调用契约要求所有位置非负且小于该长度。
+        # wrapper 的局部文本坐标满足此条件，但任意大的外部 position_ids 不能仅靠缓存预建很长来补救，
+        # 因为 rotary_emb 返回的表已切到 total_len。
         cos, sin = self.rotary_emb(q, seq_len=total_len)
         cos = cos.to(q.device)
         sin = sin.to(q.device)
@@ -261,6 +278,8 @@ class DFlashAttention(nn.Module):
         # Apply RoPE to Q (using draft positions only — last draft_len of full_position_ids)
         cos_q = cos.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
         sin_q = sin.squeeze(1).squeeze(0)[draft_position_ids].unsqueeze(1)
+        # anchors=[2,5]、每块 3 槽时 draft 位置为 [2,3,4,5,6,7]；cos_q 是 [1,1,6,4]。
+        # 第二维广播到 4 个 Q 头，同一文本位置使用相同旋转，即使它在 KV 中占据另一物理行。
         q = (q * cos_q) + (_rotate_half(q) * sin_q)
 
         # Apply RoPE to K (using full concatenated positions)
@@ -288,6 +307,8 @@ class DFlashAttention(nn.Module):
             attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=0.0)
 
         # kernel 返回 [B,Hq,N*K,D]；转置连续化后合并 head，再投影回每个 draft token 的残差宽度。
+        # 概念上的注意力分数为 [1,4,6,14]，每行沿 14 个 KV 位置归一化；kernel 不必物化整张分数表。
+        # 加权 V 后回到 [1,4,6,4]；GQA 节省 KV 头数，并没有把输出的 Q 头数也减半。
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, draft_len, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
@@ -331,6 +352,8 @@ class DFlashDecoderLayer(nn.Module):
         context_position_ids: torch.Tensor,
         block_mask=None,
     ) -> torch.Tensor:
+        # residual 保存 norm 前的 draft 分支；context 不经过此 input_layernorm，也没有 context 残差更新。
+        # 教师输出可被冻结，但 context_proj 属于草稿模型，context 分支的梯度仍可回传到它。
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
 
@@ -456,6 +479,8 @@ class DFlashDraftModel(PreTrainedModel):
                 norm(hidden_states)
                 for norm, hidden_states in zip(self.fc_norm, all_hidden_states, strict=True)
             ]
+        # 三路 [1,8,16] 得到 [1,8,48]，context_proj 再压到 [1,8,16]；层轴混入特征轴而非序列轴。
+        # 列表顺序决定线性权重每 16 列对应哪一教师层；target_layer_ids 只记录配置，不在此重排列表。
         concatenated = torch.cat(all_hidden_states, dim=-1).to(self.context_proj.weight.dtype)
         projected = self.context_proj(concatenated)
         return self.context_norm(projected)
@@ -493,6 +518,7 @@ class DFlashDraftModel(PreTrainedModel):
             draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
 
         # context_feature 不随 decoder 层更新；每层从同一教师记忆读取，但 draft_hidden 逐层变化。
+        # 这里复用的是同一 context tensor；各层独立参数会重新投影它，所以“记忆固定”不等于各层 KV 相同。
         for layer_id, layer in enumerate(self.layers):
             layer_block_mask = block_mask
             # 混合 full/SWA 架构必须逐层取 mask；单对象形式意味着每层同一策略，可避免重复存储。

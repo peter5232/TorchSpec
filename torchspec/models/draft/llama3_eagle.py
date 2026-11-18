@@ -1289,6 +1289,8 @@ class _EagleMaskedFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):
         q, k, v, out, lse = ctx.saved_tensors
+        # out/LSE 决定每个合法键的归一化权重，mask 决定哪些键根本不存在。
+        # 两者都必须复用：只传 out/LSE 而漏 mask，反向仍可能给前向未访问的 Q-K 对分配梯度。
         dq, dk, dv = _flash_attn_bwd(
             q,
             k,
@@ -1352,6 +1354,9 @@ class LlamaAttention(nn.Module):
 
         # 阶段一：线性层作用于最后维，得到 Q 的 Hq*D 和 K/V 的 Hkv*D。
         # view+transpose 仅改布局为 [B,H,S,D]，Q/K 头数不同是 GQA 的共享设计。
+        # 手算配置 B=1,S=4,H=8,Hq=4,Hkv=2,D=2：普通融合输入是 [1,4,16]，
+        # Q 投影成 [1,4,8]，K/V 各为 [1,4,4]；转置后 Q=[1,4,4,2],KV=[1,2,4,2]。
+        # 两个数值同为 4 的维度分别是头数和槽数，不能因本例尺寸相等而省略维度含义。
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -1423,6 +1428,9 @@ class LlamaAttention(nn.Module):
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+            # Hq=4,Hkv=2 时 repeat_kv 的头顺序是 [kv0,kv0,kv1,kv1]，
+            # 不是 [kv0,kv1,kv0,kv1]；Q 头 0/1 与 2/3 分别共享一组 K/V。
+            # RoPE 先作用于尚未重复的 K，再展开，避免对同一共享键重复做旋转。
             # Append to tensor cache: [bsz, num_heads, num_cached, seq_len, head_dim]
             if cache_keys is None:
                 cache_keys = key_states.unsqueeze(2)
@@ -1440,6 +1448,8 @@ class LlamaAttention(nn.Module):
             # causal
             attn_weights = torch.matmul(query_states, k0.transpose(2, 3)) / math.sqrt(self.head_dim)
 
+            # 该缓存分支需要调用方准备好的加性 mask；不像无缓存分支会在 None 时自动 causal。
+            # Eagle3Model.forward 在 SDPA 路径提前准备 [B,1,S,S]，0 表示可见、负大值屏蔽。
             attn_weights = attn_weights + attention_mask
 
             # 阶段三：第 i 轮只做 query*ki 的逐元素乘再沿 D 求和，输出 [B,H,S]，而非 S×S 矩阵。
@@ -1455,6 +1465,8 @@ class LlamaAttention(nn.Module):
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
                 query_states.dtype
             )
+            # S=4 且已有三轮时，一行 score 长 6：前四列属于 k0[0..3]，
+            # 后两列分别是 k1[t]、k2[t]。这是压紧后的候选表，不是长度 12 的缓存坐标。
             attn_weights0 = attn_weights[..., :q_len]
 
             attn_output = torch.matmul(attn_weights0, v0)
@@ -1515,6 +1527,8 @@ class LlamaFlexAttention(LlamaAttention):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
+        # 同一序列跨轮必须保持 S 不变：旧缓存长 8、S=4 得 lck=2；若误换 S=2，
+        # 会被解释成已完成四轮，连 RoPE 偏移和同槽 mask 模数都会错。缓存不能跨后端直接复用。
         lck = past_seen_tokens // q_len
         if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
             cos, sin = self.rotary_emb(query_states, position_ids + lck)
@@ -1547,6 +1561,8 @@ class LlamaFlexAttention(LlamaAttention):
 
         # 解析结构不依赖样本内容，B 维参与广播，H=1 让所有头共享同一可见关系。
         # 此 EAGLE mask 不编码 packed 样本边界，不能自行把多样本塞在一行后期望隔离。
+        # 此函数没有读取 attention_mask/use_cache：始终按缓存构造 causal+suffix。
+        # 与 SDPA 对照应比较约定下的有效查询；不能据同名参数推断两者都支持任意 padding/空洞 mask。
         block_mask = eagle3_block_mask(
             Q_LEN=q_len,
             KV_LEN=key_cache.shape[-2],
@@ -1643,6 +1659,8 @@ class LlamaFlashAttention(LlamaAttention):
         assert attention_mask is not None, "LlamaFlashAttention cached path requires attention_mask"
         # 随深度增加，每条样本可监督的尾部缩短；clamp 避免短样本在深层得到负长度。
         # 这里假定 mask 对应有效前缀长度，不能用任意中间空洞 mask 替代。
+        # 例 S=4、两条样本原有效长度为 [4,3]，第二轮 lck=1 后得到 [3,2]；
+        # 自定义 merge 将它恢复成 [1110,1100]，所以 [1011] 这类有洞输入会丢失原位置语义。
         valid_lengths = attention_mask.sum(dim=-1, dtype=torch.long) - lck
         valid_lengths = valid_lengths.clamp_(0, q_len)
 
@@ -1707,6 +1725,8 @@ class LlamaFlashAttentionMasked(LlamaAttention):
         # all other modes only need _SNAP_Q alignment.
         q_len = _snap_q_len(orig_q_len, _effective_mask_mode())
         # bucket 中的额外行只是形状占位：真实输出末尾裁掉，未来深度缓存仍按补齐宽度取模。
+        # 例 orig_q_len=130、bucket=256：两轮缓存宽 512，同槽 t=5 的后轮键在 261。
+        # 若裁缓存为 130 却仍用 256 取模，或用 130 取模读 256 宽缓存，都会连接错误链。
         pad_sz = q_len - orig_q_len
         if pad_sz > 0:
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_sz))
@@ -1761,6 +1781,9 @@ class LlamaFlashAttentionMasked(LlamaAttention):
         k_all = cache_keys.reshape(bsz, -1, self.num_key_value_heads, self.head_dim)
         v_all = cache_values.reshape(bsz, -1, self.num_key_value_heads, self.head_dim)
 
+        # 这里未使用 attention_mask，也未将每样本有效长度传给 mask pair；closure 分支
+        # 的 valid_seq_len 取的也是 bucket q_len。有效前缀查询靠因果/同槽结构避免读尾部，
+        # 不代表补位查询本身被清零；下面裁切只去掉 bucket 扩出的尾部，不去掉样本原有 padding。
         max_seq_len = q_len
         mask_mod_cute, mask_mod_flex, aux_tensors = _build_eagle3_mask_pair(
             q_len,
@@ -1858,6 +1881,8 @@ def _standard_flash_attn_varlen_forward(
     softmax_scale: float,
     causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # B=2,S=4、有效长度 [3,2] 时，flatten 后有效索引为 [0,1,2,4,5]，
+    # unpad Q=[5,Hq,D]、cu_seqlens=[0,3,5]；这里拼的是独立样本，边界交 kernel 隔离。
     q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = _std_flash_unpad_input(q, attention_mask)
     k_unpad, _, cu_seqlens_k, max_seqlen_k, _ = _std_flash_unpad_input(k, attention_mask)
     v_unpad, _, _, _, _ = _std_flash_unpad_input(v, attention_mask)
@@ -1949,6 +1974,8 @@ class _FlashCachedMergeFunc(torch.autograd.Function):
         num_kv_heads = cache_k.shape[3]
         num_groups = num_heads // num_kv_heads
         # 把 Q 头拆成 [Hkv,groups]，每个 KV 头的值能广播给同组多个 Q，无需物化重复 KV。
+        # 例如 Q=[1,4,4,2] -> [1,4,2,2,2]，最后三维是 KV头/组内Q头/D。
+        # cache_k[:,i].unsqueeze(-2) 是 [1,4,2,1,2]，在组维广播，不在序列维广播。
         q_expanded = q.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
         valid_lengths = valid_lengths.to(device=q.device, dtype=torch.long).clamp_(0, q_len)
         valid_mask = (
@@ -1985,6 +2012,8 @@ class _FlashCachedMergeFunc(torch.autograd.Function):
 
         # 若前缀未归一化质量为 3、某链键质量为 1，合并输出应为 0.75*out_prefix+0.25*v_chain。
         # 用两个分支各自 softmax 后直接相加会让该链键错误获得与整个前缀相同权重。
+        # 若某 query 前缀输出为 2、质量为 3，链 value=10、质量为 1，合并输出=4。
+        # 保存的是 log(4) 这个总分母；单链分支 LSE 就是点积分数，因为它仅有一个键。
         merged_lse = torch.logsumexp(torch.stack(lse_terms, dim=-1), dim=-1)
         out = sum(
             term * torch.exp(lse - merged_lse).unsqueeze(-1)
@@ -2061,12 +2090,16 @@ class _FlashCachedMergeFunc(torch.autograd.Function):
             wi = torch.where(valid_mask, torch.exp(lse_i - merged_lse), 0.0)
             d_out_i = grad_out_f * wi.unsqueeze(-1)
             # v_i-out 是 softmax 分母导数带来的扣除项，保证分支质量增加时其他分支权重同步下降。
+            # 接上例，标量上游梯度=1 时，链 score 导数为 0.25*(10-4)=1.5，
+            # 链 value 导数为 0.25。若把 out 换成链自身的 10，会错误得到 score 导数为 0。
             d_lse_i = wi * (grad_out_f * (vi.expand_as(out_expanded) - out_expanded)).sum(-1)
             dq += (d_lse_i.unsqueeze(-1) * scale * ki).reshape_as(q)
             # 一个 KV 头被多个 query heads 共享，对组维求和把所有头对同一参数的贡献合并。
             dcache_k[:, i] += (d_lse_i.unsqueeze(-1) * scale * q_expanded).sum(dim=3)
             dcache_v[:, i] += d_out_i.sum(dim=3)
 
+        # 返回的是整个 cache 张量的梯度：torch.cat 的 autograd 再把它分回各历史轮，
+        # 因而不是只更新当前轮 K/V。valid_lengths 和 scale 是布局/常量输入，对应 None。
         return dq.to(q.dtype), dcache_k.to(cache_k.dtype), dcache_v.to(cache_v.dtype), None, None
 
 
@@ -2217,6 +2250,9 @@ class _USPRingFlashCachedMergeFunc(torch.autograd.Function):
         q_expanded = q.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
 
         # 阶段一：ring 各 rank 交换首轮前缀 KV，得到跨分片因果注意力输出；不是只看本地 chunk。
+        # 例两个 ring 块分别负责位置 0..3 和 4..7：后块查询 5 需要前块全部首轮键
+        # 0..3 加本块 4..5；前块查询 1 不应看到后块。这里将此跨块因果任务委托 yunchang，
+        # 本文件没有展开其 send/recv 调度，不能把下方本地 suffix 循环误读成 ring 通信循环。
         out_ring, lse_ring = ring_flash_attn_forward(
             ring_group,
             q.contiguous(),
@@ -2349,12 +2385,16 @@ class LlamaUSPFlashAttention(LlamaAttention):
         position_ids: Optional[torch.LongTensor] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        # 本后端显式忽略 mask/use_cache，按固定分片执行带缓存的 attention；
+        # 上游传了 padding mask 不等于这里做了 varlen 去 padding，不能据此保证补位行输出为零。
         del attention_mask, use_cache
         bsz, q_len, _ = hidden_states.size()
         local_q_len = q_len
 
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
         # scatter_idx=2 拆头，gather_idx=1 拼序列；总元素数不变，但每 rank 计算的注意力视野变大。
+        # 以 B=1,本地S=2,Hq=4,Hkv=2,D=2,U=2 为例：Q=[1,2,4,2]
+        # 经交换变为 [1,4,2,2]；组内两 rank 各持全部四个位置的一半Q头，不是复制全头。
         query_states = self._SeqAllToAll4D.apply(
             self.ulysses_pg,
             query_states,
@@ -2367,6 +2407,8 @@ class LlamaUSPFlashAttention(LlamaAttention):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         )
         # KV 必须做与 Q 相同的通信布局转换，确保位置与共享头分组仍对应。
+        # 对应 K/V=[1,2,2,2] -> [1,4,1,2]；每 rank 的 Q/KV 头数比仍为 2。
+        # 这些数值假设头数可按 U 整分；本段不会自动填头或为不能整分的配置补救。
         key_states = self._SeqAllToAll4D.apply(
             self.ulysses_pg,
             key_states,
@@ -2388,6 +2430,8 @@ class LlamaUSPFlashAttention(LlamaAttention):
 
         q_len = query_states.shape[1]
         # 例如本地 S=256、Ulysses=2、ring=2：当前 rank 经 all-to-all 得到 512 个位置的一部分头，RoPE 表覆盖全局1024位置。
+        # 再取 R=2，全序列长 8：ring0 的 position_ids 为 [0,1,2,3]，ring1 为 [4,5,6,7]。
+        # Eagle3Model 默认按 ring_rank 产生这四项，不能只传 all-to-all 前本地的两项位置。
         global_q_len = local_q_len * self.sp_ring_degree * self.sp_ulysses_degree
 
         lck = 0 if cache_keys is None else cache_keys.shape[1]
@@ -2405,6 +2449,8 @@ class LlamaUSPFlashAttention(LlamaAttention):
             cache_keys = key_states.unsqueeze(1)
             cache_values = value_states.unsqueeze(1)
 
+        # 上例第 d 轮完成后的缓存为 [1,d+1,4,1,2]；它留在交换后的坐标系，
+        # 最后逆向 all-to-all 只作用于 attention 输出，不把缓存恢复成短序列全头。
         softmax_scale = 1.0 / math.sqrt(self.head_dim)
         # Ulysses 组之外若还有序列分片，需 ring 补齐全局因果前缀；仅 Ulysses 时本地 FA 已可覆盖。
         if self.sp_ring_degree > 1:
@@ -2431,6 +2477,8 @@ class LlamaUSPFlashAttention(LlamaAttention):
             self.scatter_idx,
             self.use_sync,
         )
+        # 上例输出由 [1,4,2,2] 还原成 [1,2,4,2]，再合头为 [1,2,8]。
+        # SeqAllToAll4D 是 autograd 算子，反向需对应的交换；这里不是参数梯度的 DP all-reduce。
         attn_output = attn_output.reshape(bsz, local_q_len, self.head_dim * self.num_heads)
         attn_output = self.o_proj(attn_output)
         return attn_output, cache_keys, cache_values

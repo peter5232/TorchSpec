@@ -27,9 +27,14 @@ import torch
 # left=True 则变 [0,a,b]；no_grad 表示这个目标对齐操作不建立反向图。
 @torch.no_grad()
 def padding(tensor, left=True):
+    # zeros_like 保留最后一槽的 dtype/device/尾随形状；[B,S,H] 生成 [B,1,H] 零向量，
+    # 而 [B,S] 生成 [B,1] 零 ID。这里的 0 是占位值，是否有效由同向移动的 mask 决定。
+    # S=1 时切片为空，结果只剩一槽零；S=0 时仍为空，不会凭空补出一个有效 token。
     zeropadding = torch.zeros_like(tensor[:, -1:])
     if left:
         tensor = torch.cat((zeropadding, tensor[:, :-1]), dim=1)
     else:
         tensor = torch.cat((tensor[:, 1:], zeropadding), dim=1)
+    # cat 生成新结果，原输入不被原地移动；不过 no_grad 已切断这次位移的反向图。
+    # 它适用于目标/ID/mask 对齐，不应不加判断地复用于需要跨步回传梯度的 draft hidden。
     return tensor

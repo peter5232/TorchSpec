@@ -411,23 +411,31 @@ class DFlashGroupedConv(nn.Module):
                 f"draft length {length} must be divisible by block_size={self.block_size}"
             )
 
+        # 例 B=1、T=6、block_size=3、H=8、group_size=2，则 num_groups=4，blocks=[2,3,4,2]。
+        # 第一维合并 batch 与块号；分块依据扁平 draft 的相邻槽，不读取 position_ids 或 attention mask。
         blocks = hidden_states.reshape(-1, self.block_size, self.num_groups, self.group_size)
         # group_size 是每组通道数，num_groups=H/group_size；动态系数在组内共享，基础核仍逐通道独立。
         dynamic = dynamic_kernel.reshape(-1, self.block_size, self.kernel_size, self.num_groups)
         base = self.base_kernel[side].reshape(
             1, 1, self.kernel_size, self.num_groups, self.group_size
         )
+        # 核长 2 时 dynamic=[2,3,2,4]，base=[1,1,2,4,2]，广播得到 [2,3,2,4,2]。
+        # 每个输出槽生成自己的系数，组内两通道共享动态增量，却仍有不同的可训练基础系数。
         coefficients = base.to(hidden_states.dtype) + dynamic.unsqueeze(-1)
 
         output = torch.zeros_like(blocks)
         for offset in range(self.kernel_size):
             # 最外层已合并 B 与块号，padding 发生在各块自己的槽维，最后一槽不会卷入下一个块。
             values = blocks if offset == 0 else F.pad(blocks[:, :-offset], (0, 0, 0, 0, offset, 0))
+            # 对槽 t：y[t,g,c]=sum_o coeff[t,o,g,c]*x[t-o,g,c]；越过本块左边界的 x 视作零。
+            # 系数来自目的槽 t，不是来源槽 t-o；这区别于把每个输入先乘动态系数再做固定卷积。
             output = output + coefficients[:, :, offset] * values
         return output.reshape(batch, length, hidden_size)
 
     # 一次投影生成前/后两套动态核，立即应用前核并返回后核；后核由子层输入决定。
     def prepare(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # 同一份子层输入一次产生两侧核；side=1 表示子层之后使用，不表示向右读取未来槽。
+        # finish 仍调用同一个左侧卷积，不在 attention/MLP 输出上重新预测动态核。
         dynamic = self.kernel_projection(hidden_states).reshape(
             *hidden_states.shape[:-1],
             2,
@@ -468,6 +476,8 @@ class CandidateSelector(nn.Module):
         *,
         training_successor_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # 设训练有 B=1、两块、每块 3 槽：wrapper 去掉首槽后 hidden=[1,2,2,H]、logits=[1,2,2,V]。
+        # top_k=3 时这里仅候选维缩成 3；完整词表 logits 已由 LM head 算过，selector 不省掉那次投影。
         unary_logits, candidate_ids = torch.topk(logits, self.top_k, dim=-1, sorted=False)
         if training_successor_ids is not None:
             matches = candidate_ids == training_successor_ids.unsqueeze(-1)
@@ -484,13 +494,21 @@ class CandidateSelector(nn.Module):
                 logits.gather(-1, training_successor_ids.unsqueeze(-1)),
                 current_logits,
             )
+            # 例候选 id=[7,2,9]、logit=[4,6,5]，正确后继=3 时替换槽 0，成为 [3,2,9]。
+            # 若 3 的原始 logit=1，对应 unary 也替为 1；不能只换 id 却保留 token7 的分数 4。
             candidate_ids = candidate_ids.scatter(-1, replace_at, replacement_ids)
             unary_logits = unary_logits.scatter(-1, replace_at, replacement_logits)
+        # token ID/top-k 的离散选择本身没有梯度；被选中的 unary 值和下面的连续投影仍保留梯度。
+        # 当前训练 caller 没有 detach hidden/logits，因此附加 selector loss 也能训练草稿骨干。
         hidden = self.hidden_projection(hidden_states)
         predecessor = self.predecessor_codebook[predecessor_ids] * hidden
+        # hidden 与前驱码都是 [...,R]，相乘得到条件向量；后继码查表结果 [...,K,R]。
+        # 同一候选 token 因前驱或 hidden 不同可获不同修正；这是候选分数，不是已归一化概率。
         successor = self.successor_codebook[candidate_ids]
         # 只对 K 个候选做秩 R 内积，成本随 K*R 而非 V² 增长；unary logits 仍参与梯度。
         scores = unary_logits + torch.einsum("...r,...kr->...k", predecessor, successor)
+        # 返回的是原候选槽对应的分数与 ID，没有按新 scores 排序，也没执行 argmax 解码。
+        # wrapper 用 candidate_ids 找正确词所在槽，再对 K 维做 CE；它使用真实前驱而非采样前驱。
         return scores, candidate_ids
 
 
@@ -501,6 +519,8 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             from torchspec.models.draft.dspark import K3DSparkMLAAttention
 
             self.attention_class = K3DSparkMLAAttention
+        # GQA 复用父类 DFlashAttention，MLA 则换成 K3DSparkMLAAttention；本文件的卷积包裹两者。
+        # 因此 DFlash 中 Hq/Hkv 的数值推演仅适用于 GQA 分支，不能套到 MLA 的低秩 KV 布局。
         super().__init__(config)
         conv_args = {
             "hidden_size": config.hidden_size,
@@ -531,6 +551,8 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             context_position_ids=context_position_ids,
             block_mask=block_mask,
         )
+        # 后卷积作用于 attention 已经混合过 KV 的输出，残差尚未相加；
+        # 即使卷积核初始化为恒等，attention/MLP 与残差仍在计算，整个 decoder 并不是恒等映射。
         draft_hidden = self.attention_conv.finish(draft_hidden, attention_kernel)
         draft_hidden = residual + draft_hidden
 
@@ -582,6 +604,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         if noise_embedding is None:
             noise_embedding = self.embed_tokens(draft_input_ids)
             draft_input_ids = None
+        # 无论外部传入 noise_embedding 还是本地查表，都在这一处缩放一次；父类收到非 None 后不再查表。
+        # output_multiplier/softcap 属于外部 loss wrapper 的 logits 阶段，本 forward 返回的仍是 hidden。
         noise_embedding = noise_embedding * self.config.input_embedding_scale
         return super().forward(
             draft_input_ids=draft_input_ids,

@@ -96,6 +96,15 @@ KV cache 保存 attention 的历史 key/value；Mooncake 在本训练流水线�
 
 每条路径都区分正常返回与中途失败。遇到“已完成”“缓存命中”“恢复成功”时，先找具体对象与完成边界，不把局部结果扩展成整条流水线的保证。
 
+深入 attention 与多卡实现时，继续按布局、计算、通信的顺序阅读：
+
+1. [padding 与 USP 坐标演算](layout-walkthrough.md)：区分存储切片、主块、通信后长度与文本位置。
+2. [EAGLE attention 内部演算](eagle-attention-walkthrough.md)：QKV/GQA/RoPE、多轮缓存、Flash 前反向与后端条件。
+3. [DFlash attention 与 selector](draft-attention-walkthrough.md)：两路输入投影、头映射、块内卷积与候选打分。
+4. [八 rank 分布式演算](distributed-walkthrough.md)：SP/DP 通信范围、梯度除数、meta 权重与 FSDP 参数管理。
+
+这一组章节尤其要区分“参数名字相同”和“实现契约相同”：attention_mask 未必被每个后端读取，序列切片与参数分片不是一回事，REPLICATE 的梯度通信规则也不能直接套到 FULL_SHARD。
+
 ## 4. 读每个函数时固定问这六个问题
 
 如果已经完成概念阅读，下一步用[监督与损失手算](loss-walkthrough.md)对照真实数组，逐项核对聊天 mask、锚点坐标、gather、CE/KL 和裁剪词表概率质量。不要只记住公式；尝试解释每个中间量在源码中来自哪一行，以及改掉它会破坏什么条件。

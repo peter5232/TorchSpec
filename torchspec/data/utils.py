@@ -60,6 +60,8 @@ class DataCollatorWithPadding:
 
     # 将 [B,n,H] 沿序列维补零或截为 [B,N,H]；保持 dtype/device，不动 hidden 维。
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
+        # 此处变量 S 是特征宽度（通常写作 H），n 才是序列长度；N 是目标序列长度。
+        # 截断分支返回原 tensor 的切片 view，等长分支直接返回原对象；只有补零 cat 分配新存储。
         B, n, S = intensors.shape
         # Truncate if longer than target (can happen when loss_mask/hidden_states
         # length differs from input_ids after unpacking).
@@ -73,6 +75,8 @@ class DataCollatorWithPadding:
 
     # 将 [B,n] ID/mask 沿序列维对齐到 N；mask 补零使新增 padding 不参与监督/有效上下文。
     def paddingtensor2D(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
+        # token ID 为 0 可能对应词表里的真实 token，因此补零本身不足以表示“无效”。
+        # attention/loss mask 必须按同一个序列边界补齐；原输入时间维长于 N 时会静默截断到 N。
         B, n = intensors.shape
         # Truncate if longer than target (prevents negative padding dimension
         # when loss_mask length differs from input_ids after collation).
@@ -99,6 +103,8 @@ class DataCollatorWithPadding:
     # 例如长度 130 和 200 都补到 256；token/hidden 可以补零，但 attention/loss mask 必须同时屏蔽这些位置。
     # USP 保留已有位置与注意力信息；可选 target/last_hidden_states 仅在全批均有时拼接。
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # features 应是非空列表，每项已含 batch 维；此处不接受普通的一维 [S] token。
+        # cat 默认 dim=0，最终 B 等于各项 B_i 之和，不是无条件等于 len(features)。
         max_length = max(item["input_ids"].shape[1] for item in features)
         max_length = ((max_length + self.sp_degree - 1) // self.sp_degree) * self.sp_degree
 
@@ -112,8 +118,14 @@ class DataCollatorWithPadding:
             # 分桶让它们都走 256 长度的计算，用一些 padding 算力换取更少的编译和稳定运行。
             _BUCKET = 128
             max_length = ((max_length + _BUCKET - 1) // _BUCKET) * _BUCKET
+            # 普通路径从 input_ids 的现有长度重建全一 mask，忽略 item 自带的 attention_mask。
+            # 若输入已补到 128，即使真实长度只有 5，这里也先把 128 槽都视为有效；
+            # 因而“原始变长样本”和“已经 collate 过的缓存项”再次入此函数时语义并不等价。
             attention_masks = [torch.ones_like(item["input_ids"]).long() for item in features]
 
+        # 长度 5 与 130 的两条样本都到 N=256，新增槽分别为 251 与 126。
+        # 相比长度 129..256 各建一种编译形状，桶内复用形状换来额外 padding 计算；
+        # 这里不保证 kernel 跳过补齐槽，具体是否省算要看 attention/loss 后端。
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
         )
@@ -134,6 +146,8 @@ class DataCollatorWithPadding:
             "last_hidden_states": None,
         }
         if self.usp_enabled:
+            # USP 位置长度独立计算，不能强行 pad 到 input_ids 长度：位置对应通信后的主块，
+            # 而 input_ids 还含 TTT 目标尾部。二者属于不同阶段的张量布局。
             max_position_length = max(item["position_ids"].shape[1] for item in features)
             batch["position_ids"] = torch.cat(
                 [
@@ -145,6 +159,8 @@ class DataCollatorWithPadding:
             batch["hidden_states"] = torch.cat(
                 [self.paddingtensor(item["hidden_states"], max_length) for item in features]
             )
+            # 可选字段采用全有才拼接的契约：A 有 target、B 没有时整个 batch.target 都是 None，
+            # 不会补一个零 target 冒充 B 的 teacher 分布。混用数据格式须由上游先统一。
             has_target = all(item.get("target") is not None for item in features)
             has_last_hs = all(item.get("last_hidden_states") is not None for item in features)
             if not has_target and not has_last_hs:
